@@ -1,0 +1,29 @@
+services:
+  # 1. Neo4j: 图数据库
+  neo4j:
+    image: neo4j:latest
+    container_name: edu_neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+      - NEO4J_PLUGINS=["apoc"] # 开启APOC插件
+    volumes:
+      - ./data/neo4j:/data
+
+  # 2. Qdrant: 向量数据库
+  qdrant:
+    image: qdrant/qdrant:latest  
+    container_name: edu_qdrant
+    ports:
+      - "6333:6333" # 向量检索接口：浏览器输入localhost:6333/dashboard
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+  
+  # 3. Redis: 缓存
+  redis:
+    image: redis:latest
+    container_name: edu_redis
+    ports:
+      - "6379:6379" # 终端输入：docker exec -it edu_redis redis-cli ping     验证redis是否开启
