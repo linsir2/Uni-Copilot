@@ -24,7 +24,7 @@ def clean_text(text: str) -> str:
     
     return text.strip()
 
-# 1. 定义一个自定义的解析函数，专门处理 "实体 | 关系 | 实体" 这种格式
+# 定义一个自定义的解析函数，专门处理 "实体 | 关系 | 实体" 这种格式
 def custom_parse_triplets(llm_output: str):
     """
     手动解析 LLM 输出，避免逗号干扰。
@@ -60,7 +60,7 @@ PDF_PATH = Path(__file__).resolve().parents[1] / "data" # / "深度学习进阶_
 # PDF_PATH = "../data/深度学习进阶_自然语言处理_斋藤康毅.pdf"
 
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "password123"
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") or ""
 NEO4J_URI = "bolt://localhost:7687"
 
 TEST_MODE = True
@@ -131,29 +131,11 @@ def main():
     file_extractor = {".pdf": parser}
 
     print("⏳ 正在请求 LlamaCloud API 进行云端解析（这可能需要几十秒）...")
-    # documents = parser.load_data(PDF_PATH)
 
     # SimpleDirectoryReader中加入参数recursive=True，可以让这个reader读取填入的路径下的子文件夹
     raw_docs = SimpleDirectoryReader(input_dir=PDF_PATH, file_extractor=file_extractor).load_data() # pyright: ignore[reportArgumentType]
-    # for doc in documents:
-    #     # 获取原始内容
-    #     original_text = doc.get_content() # 或者 doc.text
     
-    #     # 清洗
-    #     cleaned_text = clean_text(original_text)
-    
-    #     # ✅ 使用 set_content 替代 doc.text = ... 以消除 Pylance 报错
-    #     doc.set_content(cleaned_text)
-
-    # print(f"🧹 已清洗 {len(documents)} 页文档的噪声数据。")
-    
-    """
     # ⚠️ 测试模式截断
-    if TEST_MODE:
-        print("⚡️ [测试模式] 仅处理前 20 页数据...")
-        documents = documents[30:45]
-    """
-
     raw_docs = raw_docs[30:60]
 
     documents = []
@@ -190,45 +172,6 @@ def main():
         local_files_only=True,
     )
 
-    # kg_extractor = SimpleLLMPathExtractor(
-    #     llm=llm,
-    #     max_paths_per_chunk=15, # 每段文本最多提取15条关系，防止幻觉
-    #     num_workers=4
-    # )
-
-    # kg_prompt_template = (
-    #     "你是一个知识图谱提取专家。\n"
-    #     "请从以下文本中提取实体和关系，格式为 (实体1, 关系, 实体2)。\n"
-    #     "不要输出任何介绍性文字（如'Here are some facts...'）。\n"
-    #     "---------------------\n"
-    #     "{text}\n"
-    #     "---------------------\n"
-    # )
-
-#     kg_prompt_template = """
-# 你是一名【中文计算机教材】知识图谱构建专家。
-
-# 请从下列教材文本中，尽可能多地提取【有意义的实体关系三元组】。
-
-# 要求：
-# 1. 每条输出为一行
-# 2. 格式为：实体1, 关系, 实体2
-# 3. 实体请使用教材中的原始中文术语
-# 4. 关系请使用简短英文动词或动词短语（如 IS_A, USES, PART_OF, APPLIED_TO 等）
-# 5. 如果关系在语义上成立，即可输出，不必过度保守，但也不能随便创建关系
-# 6. 不要输出任何解释性文字
-
-# 教材文本：
-# {text}
-# """
-
-#     kg_extractor = SimpleLLMPathExtractor(
-#         llm=llm,
-#         extract_prompt=kg_prompt_template,
-#         max_paths_per_chunk=15,
-#         num_workers=4
-#     )
-
     kg_prompt_template = """
 你是一名【计算机科学】知识图谱构建专家。
 请从下列教材文本中提取【核心概念】及其【关系】，构建知识三元组。
@@ -254,7 +197,7 @@ def main():
 {text}
 """
 
-    # 3. 实例化 Extractor 时，传入 parse_fn
+    # 实例化 Extractor 时，传入 parse_fn
     kg_extractor = SimpleLLMPathExtractor(
         llm=llm,
         extract_prompt=kg_prompt_template,

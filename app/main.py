@@ -29,7 +29,7 @@ QDRANT_URL = "http://localhost:6333"
 QDRANT_COLLECTION = "edu_matrix_v2"
 NEO4J_URL = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "password123"
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") or ""
 
 # 全局引擎容器
 rag_engine = {}
@@ -123,6 +123,8 @@ async def lifespan(app: FastAPI):
         # C. 组装混合检索器
         hybrid_retriever = HybridRetriever(vector_tool, graph_tool)
 
+        rag_engine["hybrid_retriever"] = hybrid_retriever
+
         # 5. 构建智能对话引擎 (ChatEngine)
         print("🤖 构建 ContextChatEngine...")
         memory = ChatMemoryBuffer.from_defaults(token_limit=3000)
@@ -184,15 +186,15 @@ async def chat_endpoint(request: ChatRequest):
     ]
 
     # 3. 调用引擎 (流式)
-    streaming_response = rag_engine["chat_engine"].stream_chat(
+    streaming_response = await rag_engine["chat_engine"].astream_chat(
         last_message,
         chat_history=chat_history,
     )
 
     # 4. 生成流式响应
-    def response_generator():
+    async def response_generator():
         # A. 吐出 AI 回答
-        for token in streaming_response.response_gen:
+        async for token in streaming_response.async_response_gen():
             yield token
         
         # B. 吐出参考来源 (如果有)

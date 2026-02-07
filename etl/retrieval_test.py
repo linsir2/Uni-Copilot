@@ -17,7 +17,7 @@ QDRANT_COLLECTION = "edu_matrix_v2" # 对应 ingest_pipeline.py 里的名字
 
 NEO4J_URL = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "password123"
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") or ""
 
 def main():
     print("🚀 [Hybrid Search] 正在初始化检索引擎...")
