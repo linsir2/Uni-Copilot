@@ -4,6 +4,7 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 from dotenv import load_dotenv
 import nest_asyncio
 import asyncio
+from pathlib import Path
 load_dotenv()
 nest_asyncio.apply() # 运行嵌套使用asyncio循环
 
@@ -11,11 +12,10 @@ from llama_parse import LlamaParse, ResultType
 from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
 from llama_index.core import Settings, VectorStoreIndex, StorageContext
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.readers.file import PyMuPDFReader
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 import qdrant_client
 
-PDF_PATH = "../data/深度学习进阶_自然语言处理_斋藤康毅.pdf"
+PDF_PATH = Path(__file__).resolve().parents[1] / "data" / "深度学习进阶_自然语言处理_斋藤康毅.pdf"
 
 QDRANT_URL = "http://localhost:6333"
 COLLECTION_NAME = "edu_matrix_v2"
@@ -30,10 +30,18 @@ async def main():
         language="ch_sim",
         num_workers=4,
         api_key=os.getenv("LLAMACLOUD_API_KEY") or "",
+        fast_mode=False,
+        system_prompt="""
+        这是一个计算机科学教材。
+        1. 请精确保留所有的数学公式（使用 LaTeX 格式）。
+        2. 不要输出页眉和页脚的页码信息。
+        3. 如果遇到表格，请将其转换为 Markdown 表格。
+        4. 保持正文的连贯性。不要输出 'Here are some facts' 这类无关文字。
+        """,
     )
 
     print("⏳ 正在请求 LlamaCloud API 进行云端解析（这可能需要几十秒）...")
-    documents = await parser.aload_data(PDF_PATH)
+    documents = await parser.aload_data(str(PDF_PATH))
 
     # print("\n--- [Preview] Markdown 源码预览 ---")
     # print(documents[0].text[:500])

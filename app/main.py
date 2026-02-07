@@ -80,6 +80,7 @@ async def lifespan(app: FastAPI):
             api_key=os.getenv("DASHSCOPE_API_KEY"),
             temperature=0.1,
         )
+        rag_engine["llm"] = llm
 
         # 2. 连接 Qdrant (负责原文检索)
         print("🔌 连接 Qdrant (Vector Store)...")
@@ -101,6 +102,8 @@ async def lifespan(app: FastAPI):
             property_graph_store=graph_store,
             llm=llm
         )
+
+        rag_engine["graph_store"] = graph_store
 
         # 4. 构建混合检索策略
         # A. 向量检索工具
@@ -208,3 +211,83 @@ async def chat_endpoint(request: ChatRequest):
 @app.get("/")
 def read_root():
     return {"message": "EduMatrix API is running! Go to /docs for Swagger UI."}
+# 确保在文件顶部有这个导入
+from neo4j import GraphDatabase
+
+@app.post("/api/graph")
+async def get_graph(request: ChatRequest):
+    # 默认返回值
+    result_data = {"links": []}
+    
+    try:
+        # 1. 安全获取关键词
+        if not request.messages or not request.messages[-1].content:
+            print("⚠️ [Graph API] 收到空消息")
+            return result_data
+            
+        user_query = request.messages[-1].content
+        print(f"📩 [Graph API] 用户原始提问: {user_query}")
+
+        # 定义提取 Prompt，强制要求格式简洁
+        extract_prompt = (
+            "你是一个不仅懂中文，还懂计算机科学的实体提取助手。\n"
+            "请从用户的提问中提取出 1 到 3 个最核心的【实体关键词】，用于在知识图谱中检索。\n"
+            "要求：\n"
+            "1. 只返回关键词，用逗号 ',' 分隔。\n"
+            "2. 去掉所有修饰词（如'请问'、'是什么'、'介绍一下'）。\n"
+            "3. 如果没有明显实体，提取最关键的名词。\n"
+            "4. 不要输出任何其他废话。\n"
+            "\n"
+            f"用户提问：{user_query}\n"
+            "关键词："
+        )
+
+        response = await rag_engine["llm"].acomplete(extract_prompt)
+        llm_output = response.text.strip()
+
+        # 清洗 LLM 输出：按逗号分割 -> 去空 -> 去重
+        keywords = [k.strip() for k in llm_output.split(',') if k.strip()]
+        
+        # 再次兜底：如果 LLM 啥都没吐出来
+        if not keywords:
+            keywords = [user_query]
+        
+        print(f"🔍 [Graph API] LLM 提取的关键词: {keywords}")
+
+        # Cypher 解释：
+        # ANY(k IN $keywords WHERE ...) : 只要节点名字包含列表里的任意一个词，就匹配
+        # toLower(...) : 忽略大小写
+        # type(r) <> 'MENTIONS' : 过滤掉那些没有语义的引用连线
+        cypher_sql = """
+        MATCH (n)-[r]->(m)
+        WHERE (
+            ANY(k IN $keywords WHERE toLower(n.id) CONTAINS toLower(k)) 
+            OR 
+            ANY(k IN $keywords WHERE toLower(m.id) CONTAINS toLower(k))
+        )
+        AND type(r) <> 'MENTIONS'
+        RETURN n.id AS source, type(r) AS label, m.id AS target
+        LIMIT 30
+        """
+        
+        # 3. 连接数据库
+        # 请确保 NEO4J_URL, NEO4J_USER, NEO4J_PASSWORD 变量已定义
+        driver = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        
+        with driver.session() as session:
+            result = session.run(cypher_sql, keywords=keywords)
+            records = [record.data() for record in result]
+            print(f"✅ Neo4j 查询成功，找到 {len(records)} 条关系")
+            result_data["links"] = records
+            
+        driver.close()
+
+    except Exception as e:
+        # 🔥 关键：打印详细错误，方便你在终端看到
+        import traceback
+        traceback.print_exc() 
+        print(f"❌ Neo4j 查询发生严重错误: {str(e)}")
+        # 即使出错，result_data 也是 {"links": []}，不会是 None
+
+    # 🔥 关键：无论 try 里发生了什么，这里一定会返回一个字典
+    return result_data

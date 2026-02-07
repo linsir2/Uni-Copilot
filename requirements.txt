@@ -6,6 +6,7 @@ aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1
+asttokens==3.0.1
 async-timeout==5.0.1
 attrs==25.4.0
 banks==2.3.0
@@ -19,11 +20,13 @@ cuda-bindings==12.9.4
 cuda-pathfinder==1.3.3
 dashscope==1.22.2
 dataclasses-json==0.6.7
+decorator==5.2.1
 defusedxml==0.7.1
 Deprecated==1.2.18
 dirtyjson==1.0.8
 distro==1.9.0
 exceptiongroup==1.3.1
+executing==2.2.1
 fastapi==0.128.1
 ffmpy==1.0.0
 filelock==3.20.3
@@ -45,9 +48,12 @@ httpx==0.28.1
 huggingface_hub==1.4.0
 hyperframe==6.1.0
 idna==3.11
+ipython==8.38.0
+jedi==0.19.2
 Jinja2==3.1.6
 jiter==0.13.0
 joblib==1.5.3
+jsonpickle==4.1.1
 llama-cloud==0.1.35
 llama-cloud-services==0.6.54
 llama-index==0.14.13
@@ -69,6 +75,7 @@ llama-parse==0.6.54
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 marshmallow==3.26.2
+matplotlib-inline==0.2.1
 mdurl==0.1.2
 mpmath==1.3.0
 multidict==6.7.1
@@ -97,11 +104,16 @@ openai==2.16.0
 orjson==3.11.7
 packaging @ file:///home/task_176104877067765/conda-bld/packaging_1761049113113/work
 pandas==2.3.3
+parso==0.8.5
+pexpect==4.9.0
 pillow==12.1.0
 platformdirs==4.5.1
 portalocker==3.2.0
+prompt_toolkit==3.0.52
 propcache==0.4.1
 protobuf==6.33.5
+ptyprocess==0.7.0
+pure_eval==0.2.3
 pydantic==2.12.5
 pydantic_core==2.41.5
 pydub==0.25.1
@@ -112,6 +124,7 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 python-multipart==0.0.22
 pytz==2025.2
+pyvis==0.3.2
 PyYAML==6.0.3
 qdrant-client==1.16.2
 regex==2026.1.15
@@ -128,6 +141,7 @@ six==1.17.0
 sniffio==1.3.1
 soupsieve==2.8.3
 SQLAlchemy==2.0.46
+stack-data==0.6.3
 starlette==0.50.0
 striprtf==0.0.26
 sympy==1.14.0
@@ -138,6 +152,7 @@ tokenizers==0.22.2
 tomlkit==0.13.3
 torch==2.10.0
 tqdm==4.67.3
+traitlets==5.14.3
 transformers==5.0.0
 triton==3.6.0
 typer==0.21.1
@@ -148,6 +163,7 @@ typing_extensions==4.15.0
 tzdata==2025.3
 urllib3==2.6.3
 uvicorn==0.40.0
+wcwidth==0.6.0
 websocket-client==1.9.0
 wrapt==1.17.3
 yarl==1.22.0

@@ -1,85 +1,156 @@
 import gradio as gr
 import requests
+import html
+from pyvis.network import Network
+import tempfile
+import os
 
-# FastAPI 后端地址
-API_URL = "http://127.0.0.1:8000/api/chat"
+# ================= 配置 =================
+API_CHAT_URL = "http://127.0.0.1:8000/api/chat"
+API_GRAPH_URL = "http://127.0.0.1:8000/api/graph"
 
-# 🧼 数据清洗工具：处理 Gradio 复杂格式
 def clean_content(content):
-    """
-    把 Gradio 返回的复杂结构 [{'text': 'abc', 'type': 'text'}] 清洗成纯字符串
-    """
-    if isinstance(content, str):
-        return content
-    
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_parts.append(part.get("text", ""))
-        return "".join(text_parts)
-        
+    if content is None: return ""
     return str(content)
 
-def chat_with_backend(message, history):
-    """
-    与后端交互的主函数
-    """
-    if not message:
-        yield "请输入问题..."
-        return
-
-    # 1. 构造 messages 列表 (带清洗逻辑)
-    messages_payload = []
-    
-    for item in history:
-        # 兼容 Gradio 新旧版本格式
-        role = None
-        raw_content = None
-        
-        if isinstance(item, dict): # 新版
-            role = item.get("role")
-            raw_content = item.get("content")
-        elif isinstance(item, (list, tuple)) and len(item) >= 2: # 旧版
-            # 简化处理，暂时跳过旧版解析，主要依赖新版 type="messages"
-            pass 
-
-        if role and raw_content:
-            clean_text = clean_content(raw_content)
-            if clean_text:
-                messages_payload.append({"role": role, "content": clean_text})
-    
-    # 加入当前问题
-    current_msg_clean = clean_content(message)
-    messages_payload.append({"role": "user", "content": current_msg_clean})
-
-    # 2. 发送请求
-    payload = {"messages": messages_payload}
+# 🕸️ 1. 画图函数
+def generate_graph_html(query):
+    if not query: return "<div>请先提问...</div>"
     
     try:
-        response = requests.post(API_URL, json=payload, stream=True, timeout=60)
+        # 1. 构造请求 (后端需要 list[dict])
+        payload = {"messages": [{"role": "user", "content": query}]}
+        response = requests.post(API_GRAPH_URL, json=payload, timeout=10)
+        
+        try:
+            data = response.json()
+        except:
+            return f"<div>❌ 后端返回异常: {response.text[:50]}...</div>"
+
+        if data is None:
+            return "<div>❌ 后端返回了空数据 (None)</div>"
+            
+        links = data.get("links", [])
+        
+        if not links:
+            return f"<div style='text-align:center; padding:20px; color: gray'>📭 关键词 '{query}' 未找到相关图谱<br>(请尝试书中的核心概念，如：深度学习、神经网络)</div>"
+
+        # 2. 绘图逻辑 (Pyvis)
+        # 注意：这里去掉了 font_color 参数，防止 Pylance 报错
+        net = Network(height="500px", width="100%", bgcolor="#ffffff", notebook=False)
+        
+        for link in links:
+            src = link.get("source", "未知")
+            tgt = link.get("target", "未知")
+            rel = link.get("label", "关联")
+            
+            net.add_node(src, label=src, color="#4ecdc4", title=src)
+            net.add_node(tgt, label=tgt, color="#ff6b6b", title=tgt)
+            net.add_edge(src, tgt, title=rel, label=rel)
+
+        net.force_atlas_2based()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w+", encoding="utf-8") as tmp:
+            net.save_graph(tmp.name)
+            tmp.seek(0)
+            raw_html = tmp.read()
+        os.unlink(tmp.name)
+        escaped_html = html.escape(raw_html)
+        iframe_html = f'''
+        <iframe 
+            style="width: 100%; height: 500px; border: 1px solid #eee; border-radius: 8px;" 
+            srcdoc="{escaped_html}">
+        </iframe>
+        '''
+        return iframe_html
+
+    except Exception as e:
+        return f"<div>❌ 图谱生成代码出错: {str(e)}</div>"
+
+# 🗣️ 2. 聊天函数 (🔥 关键：手动转换格式)
+def chat_with_backend(message, history):
+    # 【输入状态】
+    # 因为没有 type="messages"，Gradio 传给我们的 history 绝对是 [[问, 答], [问, 答]]
+    if history is None:
+        history = []
+        
+    # 1. 格式转换：前端 List[List] -> 后端 List[Dict]
+    messages_payload = []
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role and content:
+            messages_payload.append({
+                "role": role,
+                "content": clean_content(content)
+            })
+
+    # 当前用户输入
+    messages_payload.append({
+        "role": "user",
+        "content": clean_content(message)
+    })
+
+    # 2. 流式请求
+    try:
+        payload = {"messages": messages_payload}
+        response = requests.post(API_CHAT_URL, json=payload, stream=True, timeout=60)
+        
+        partial_text = ""
         
         if response.status_code == 200:
-            partial_text = ""
             for chunk in response.iter_content(chunk_size=1024):
                 if chunk:
                     text_chunk = chunk.decode("utf-8", errors="replace")
                     partial_text += text_chunk
-                    yield partial_text
+                    
+                    # 🔥 【输出状态】
+                    # 我们必须 yield List[List]，不然 Gradio 就会报 Data incompatible
+                    # 这里的逻辑是：返回 旧历史 + [当前问, 当前生成的答]
+                    yield history + [
+    {"role": "user", "content": message},
+    {"role": "assistant", "content": partial_text},
+]
         else:
-            yield f"❌ 服务器报错 (状态码 {response.status_code}):\n{response.text}"
-            
-    except Exception as e:
-        yield f"❌ 连接失败，请检查 uvicorn 是否启动。\n错误详情: {str(e)}"
+            yield history + [
+    {"role": "user", "content": message},
+    {"role": "assistant", "content": f"❌ Error {response.status_code}: {response.text}"}]
 
-# 创建聊天界面
-demo = gr.ChatInterface(
-    fn=chat_with_backend,
-    title="🎓 EduMatrix 智能助教",
-    description="基于 Hybrid RAG (Vector + Graph) + Memory 构建",
-    examples=["神经网络包含什么？", "它有什么优缺点？", "死锁产生的必要条件是什么？"],
-)
+    except Exception as e:
+        yield history + [
+    {"role": "user", "content": message},
+    {"role": "assistant", "content": f"❌ Connection Error: {str(e)}"}]
+
+# ================= UI 定义 =================
+with gr.Blocks(title="🎓 EduMatrix Pro") as demo:
+    gr.Markdown("## 🎓 EduMatrix: 知识图谱智能助教")
+    
+    with gr.Row():
+        with gr.Column(scale=6):
+            # 🔥 绝对不加 type="messages"，这里是空的！
+            # 这样它就会默认使用 List[List] 模式
+            chatbot = gr.Chatbot(height=600)
+            
+            msg = gr.Textbox(label="你的问题", placeholder="试着问：什么是自然语言处理？")
+            clear = gr.ClearButton([msg, chatbot])
+
+        with gr.Column(scale=4):
+            gr.Markdown("### 🕸️ 知识关联图谱")
+            graph_view = gr.HTML(value="<div style='text-align:center; color:gray'>图谱将在这里显示...</div>")
+
+    # 事件绑定
+    msg.submit(generate_graph_html, inputs=[msg], outputs=[graph_view])
+    
+    # 聊天绑定
+    msg.submit(
+        chat_with_backend, 
+        inputs=[msg, chatbot], # 传入旧历史 (List[List])
+        outputs=[chatbot]      # 输出新历史 (List[List])
+    ).then(
+        lambda: "", outputs=[msg] # 清空输入框
+    )
 
 if __name__ == "__main__":
-    print("🚀 前端已启动: http://localhost:7860")
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    print("🚀 前端启动中 (兼容模式)...")
+    demo.launch(server_name="0.0.0.0", server_port=7860, theme="soft")
