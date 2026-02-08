@@ -1,8 +1,10 @@
-from typing import Annotated, Dict, TypedDict, List, Any
+from typing import TypedDict, List, Any
 from langgraph.graph import StateGraph, END
-from llama_index.core.schema import NodeWithScore
+from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.llms import ChatMessage
-from main import rag_engine
+import os
+import requests
+
 
 class AgentState(TypedDict):
     question: str # 当前的问题（可能是被重写过的版本）
@@ -12,6 +14,7 @@ class AgentState(TypedDict):
     grade_status: str # "yes" or "no"
     retry_count: int
     final_response: Any
+    source: str # local or web
 
 def create_graph_app(retriever, llm):
     """构建并编译 LangGraph 工作流"""
@@ -25,14 +28,62 @@ def create_graph_app(retriever, llm):
             f"只回复 'yes' 或 'no'，不要废话。"
         )
     
+    def tavily_search(query: str):
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            print("⚠️ 未配置 TAVILY_API_KEY，跳过联网搜索。")
+            return []
+        
+        print(f"🌍 [Tavily] 正在搜索互联网: {query}")
+        payload = {
+            "api_key": api_key,
+            "query": query,
+            "search_depth": "advanced",
+            "include_answer": True,
+            "max_results": 3,
+        }
+
+        try:
+            response = requests.post(
+                url=os.getenv("TAVILY_BASE_URL") or "",
+                json=payload,
+                timeout=20,
+            )
+            data = response.json()
+
+            nodes = []
+
+            if data.get("answer"):
+                nodes.append(
+                    NodeWithScore(
+                        node=TextNode(text=f"【Tavily 智能摘要】: {data['answer']}"),
+                        score=1.0,
+                    )
+                )
+            
+            for result in data.get("results", []):
+                content = f"【来源: {result['title']}】\n{result['content']}\n(URL: {result['url']})"
+                nodes.append(
+                    NodeWithScore(
+                        node=TextNode(text=content),
+                        score=0.9,
+                    )
+                )
+            
+            return nodes
+        
+        except Exception as e:
+            print(f"❌ Tavily 搜索失败: {e}")
+            return []
+
     async def retrieve_node(state: AgentState):
         print("🔍 [Node] Retrieving...")
         question = state["question"]
     
-        nodes = await retriever.aretriever(question)
+        nodes = await retriever.aretrieve(question)
 
         print(f"   -> 检索到 {len(nodes)} 条相关片段")
-        return {"retrieved_nodes": nodes}
+        return {"retrieved_nodes": nodes, "source": "local"}
     
     async def grade_node(state: AgentState):
         print("⚖️ [Agent] 正在评估资料质量...")
@@ -83,6 +134,34 @@ def create_graph_app(retriever, llm):
             "retry_count": state.get("retry_count", 0) + 1
         }
     
+    async def web_search_node(state: AgentState):
+        print("🌍 [Agent] 本地彻底没戏了，启动 Deep Research (Tavily)...")
+        query = state["original_question"]
+
+        web_nodes = tavily_search(query)
+
+        print(f"   -> 联网获取了 {len(web_nodes)} 条信息")
+        # 覆盖掉之前的本地结果，因为本地的反正也没用
+        return {"retrieved_nodes": web_nodes, "source": "web"}
+    
+    async def grade_web_node(state: AgentState):
+        print("⚖️ [Agent] 正在审核网络搜索结果...")
+
+        query = state["original_question"]
+        nodes = state["retrieved_nodes"]
+
+        if not nodes:
+            print("   -> 网络搜索为空")
+            return {"grade_status": "no"}
+        
+        context_preview = "\n".join([n.get_content()[:300] for n in nodes[:3]])
+        prompt = get_grader_prompt(query, context_preview)
+
+        response = await llm.acomplete(prompt)
+        status = "yes" if "yes" in response.text.strip().lower() else "no"
+        print(f"-> 网络评分结果: {status}")
+        return {"grade_status": status}
+    
     async def generate_node(state: AgentState):
         print("✍️ [Agent] 正在组织语言生成回答 (Async)...")
         final_question = state["original_question"]
@@ -102,42 +181,63 @@ def create_graph_app(retriever, llm):
 
         return {"final_response": response_stream}
     
+    # 当全网都搜不到时，体面地结束
+    async def apologize_node(state: AgentState):
+        print("🛑 [Agent] 彻底放弃，执行 Fallback...")
+        text = "非常抱歉，我在本地教材和互联网上都没有找到相关信息。这可能是一个非常生僻的知识点，建议您查阅更专业的学术文献。"
+        # 直接返回字符串，main.py 也能处理
+        return {"final_response": text}
+    
     workflow = StateGraph(AgentState)
 
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("grade", grade_node)
     workflow.add_node("rewrite", rewrite_node)
+    workflow.add_node("web_search", web_search_node)
+    workflow.add_node("grade_web", grade_web_node)
     workflow.add_node("generate", generate_node)
+    workflow.add_node("apologize", apologize_node)
 
     workflow.set_entry_point("retrieve")
 
     workflow.add_edge("retrieve", "grade")
     workflow.add_edge("rewrite", "retrieve")
+    workflow.add_edge("web_search", "grade_web")
 
-    # --- 关键逻辑：条件边 ---
-    def decide_next_step(state):
-        status = state["grade_status"]
-        retries = state.get("retry_count", 0)
-
-        if status == "yes":
-            return "generate" # 资料够了，去生成
+    # 条件边 1: 本地评分后
+    def decide_local(state):
+        if state["grade_status"] == "yes":
+            return "generate"
+        elif state.get("retry_count", 0) < 1:
+            return "rewrite"
         else:
-            if retries < 1: # 🚨 最多重试 1 次，防止死循环
-                return "rewrite"
-            else:
-                # 试过了还是不行，强行生成（或者这就该去 Tavily 了）
-                print("🛑 [Agent] 重试次数耗尽，强行生成...")
-                return "generate"
-
+            return "web_search"
+    
     workflow.add_conditional_edges(
-        "grade",
-        decide_next_step,
+        "grade", decide_local,
         {
             "generate": "generate",
-            "rewrite": "rewrite"
+            "rewrite": "rewrite",
+            "web_search": "web_search",
         }
     )
 
+    # 🆕 条件边 2: 网络评分后
+    def decide_web(state):
+        if state["grade_status"] == "yes":
+            return "generate" # 网络结果靠谱，去生成
+        else:
+            return "apologize" # 网络结果也是垃圾，去道歉
+    
+    workflow.add_conditional_edges(
+        "grade_web", decide_web,
+        {
+            "generate": "generate",
+            "apologize": "apologize",
+        }
+    )
+
+    workflow.add_edge("apologize", END)
     workflow.add_edge("generate", END)
 
     app = workflow.compile()

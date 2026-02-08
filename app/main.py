@@ -6,13 +6,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
+from .agent_workflow import create_graph_app
 
 # LlamaIndex 核心组件
 from llama_index.core import Settings, VectorStoreIndex, PropertyGraphIndex
 from llama_index.llms.dashscope import DashScope
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.chat_engine import ContextChatEngine
-from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.llms import ChatMessage
 from llama_index.core.retrievers import BaseRetriever
 
@@ -119,35 +118,16 @@ async def lifespan(app: FastAPI):
         graph_tool = graph_index.as_retriever(
             sub_retrievers=[sub_retriever]
         )
-        
+
         # C. 组装混合检索器
         hybrid_retriever = HybridRetriever(vector_tool, graph_tool)
 
-        rag_engine["hybrid_retriever"] = hybrid_retriever
+        # 5. 🔥 构建 Agent (替换原来的 ChatEngine)
+        print("🤖 构建 LangGraph Agent...")
+        # 把 llm 和 retriever 传进去
+        graph_app = create_graph_app(hybrid_retriever, llm)
 
-        # 5. 构建智能对话引擎 (ChatEngine)
-        print("🤖 构建 ContextChatEngine...")
-        memory = ChatMemoryBuffer.from_defaults(token_limit=3000)
-
-        chat_engine = ContextChatEngine.from_defaults(
-            retriever=hybrid_retriever,
-            memory=memory,
-            llm=llm,
-            system_prompt="""
-            你是一名专业的计算机课程助教 (EduMatrix)。
-            
-            【你的资源】：
-            1. **对话历史**：用户之前的提问和你之前的回答。
-            2. **背景知识**：检索到的教材原文(Qdrant)和图谱关系(Neo4j)。
-
-            【回答策略】：
-            1. 🚨 **最高优先级**：如果用户问**“你刚才说的”**、**“上一次回答”**等历史相关问题，请**务必优先基于【对话历史】**回答，不要重新检索或编造。
-            2. 对于知识性问题，请基于【背景知识】回答，并尝试理清概念间的关系。
-            3. 如果背景知识不足，请诚实告知。
-            """
-        )
-
-        rag_engine["chat_engine"] = chat_engine
+        rag_engine["graph_app"] = graph_app
         print("✅ 引擎初始化完成！等待请求...")
 
     except Exception as e:
@@ -185,28 +165,57 @@ async def chat_endpoint(request: ChatRequest):
         for m in request.messages[:-1]
     ]
 
-    # 3. 调用引擎 (流式)
-    streaming_response = await rag_engine["chat_engine"].astream_chat(
-        last_message,
-        chat_history=chat_history,
-    )
+    inputs = {
+    "question": last_message,
+    "original_question": last_message, # ✅ 新增这个
+    "chat_history": chat_history,
+    "retrieved_nodes": [],
+    "grade_status": "",
+    "retry_count": 0, # ✅ 初始化计数器
+    "final_response": ""
+}
+
+    # 运行图谱，直到结束
+    # 注意：我们的 generate_node 返回的是一个 stream iterator 对象
+    result = await rag_engine["graph_app"].ainvoke(inputs)
+
+    streaming_response = result["final_response"]
 
     # 4. 生成流式响应
     async def response_generator():
         # A. 吐出 AI 回答
-        async for token in streaming_response.async_response_gen():
-            yield token
+        # situation A: 如果是普通字符串 (来自 Apologize Node)
+        if isinstance(streaming_response, str):
+            yield streaming_response
+            
+        # situation B: 如果是流式响应对象 (来自 Generate Node)
+        elif hasattr(streaming_response, "async_response_gen"):
+            async for token in streaming_response.async_response_gen():
+                yield token.delta
+        
+        # situation C: 兜底 (有些版本的 LlamaIndex 返回的是直接的 AsyncGenerator)
+        else:
+            try:
+                async for token in streaming_response:
+                    yield token.delta
+            except Exception as e:
+                yield f"❌ 响应解析错误: {str(e)}"
+
         
         # B. 吐出参考来源 (如果有)
-        if streaming_response.source_nodes:
-            yield "\n\n---\n**📚 参考来源：**\n"
-            seen_sources = set()
-            for node in streaming_response.source_nodes:
-                # 简单去重和清洗
-                clean_text = node.text[:100].replace('\n', ' ')
-                if clean_text not in seen_sources:
-                    yield f"- {clean_text}...\n"
-                    seen_sources.add(clean_text)
+        nodes = result.get("retrieved_nodes", [])
+        if nodes:
+            yield "\n\n---\n**🧠 思考路径：**\n"
+            yield f"- 检索到 {len(nodes)} 个知识片段\n"
+            yield "- 正在基于 Graph + Vector 进行推理...\n"
+                
+            yield "\n**📚 参考来源：**\n"
+            seen = set()
+            for n in nodes:
+                txt = n.get_content()[:50].replace('\n', ' ')
+                if txt not in seen:
+                    yield f"> {txt}...\n"
+                    seen.add(txt)
             
     return StreamingResponse(response_generator(), media_type="text/plain")
 
