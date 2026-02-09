@@ -113,7 +113,7 @@ async def lifespan(app: FastAPI):
         sub_retriever = VectorContextRetriever(
             graph_store=graph_store,
             similarity_top_k=5,
-            path_depth=2 # 抓取 2 跳邻居
+            path_depth=3 # 抓取 3 跳邻居
         )
         graph_tool = graph_index.as_retriever(
             sub_retrievers=[sub_retriever]

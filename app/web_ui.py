@@ -106,7 +106,7 @@ def chat_with_backend(message, history):
                     partial_text += text_chunk
                     
                     # 🔥 【输出状态】
-                    # 我们必须 yield List[List]，不然 Gradio 就会报 Data incompatible
+                    # 我们必须 yield List[Dict]，不然 Gradio 就会报 Data incompatible
                     # 这里的逻辑是：返回 旧历史 + [当前问, 当前生成的答]
                     yield history + [
     {"role": "user", "content": message},

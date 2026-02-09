@@ -79,11 +79,29 @@ def create_graph_app(retriever, llm):
     async def retrieve_node(state: AgentState):
         print("🔍 [Node] Retrieving...")
         question = state["question"]
-    
-        nodes = await retriever.aretrieve(question)
+        chat_history = state.get("chat_history", [])
+
+        # 如果有历史记录，则进行 Query 压缩/改写
+        if chat_history:
+            history_str = "\n".join([f"{m.role}: {m.content}" for m in chat_history[-3:]]) # 取最近3轮
+            rewrite_prompt = (
+                f"结合以下对话历史，将用户最新的问题改写为一个独立、完整的搜索指令。\n"
+                f"对话历史:\n{history_str}\n"
+                f"当前问题: {question}\n"
+                f"改写后的完整问题（只需输出改写后的文本）:"
+            )
+            # 调用 llm 进行改写
+            rewrite_res = await llm.acomplete(rewrite_prompt)
+            search_query = rewrite_res.text.strip()
+            print(f"   -> 转换后的 Query: {search_query}")
+        else:
+            search_query = question
+
+        # 使用转换后的 search_query 进行检索
+        nodes = await retriever.aretrieve(search_query)
 
         print(f"   -> 检索到 {len(nodes)} 条相关片段")
-        return {"retrieved_nodes": nodes, "source": "local"}
+        return {"retrieved_nodes": nodes, "source": "local", "question": search_query}
     
     async def grade_node(state: AgentState):
         print("⚖️ [Agent] 正在评估资料质量...")
@@ -163,22 +181,50 @@ def create_graph_app(retriever, llm):
         return {"grade_status": status}
     
     async def generate_node(state: AgentState):
-        print("✍️ [Agent] 正在组织语言生成回答 (Async)...")
-        final_question = state["original_question"]
+        print("✍️ [Agent] 正在组织语言生成回答 (含引用)...")
+        source_type = state.get("source", "local")
         nodes = state["retrieved_nodes"]
-        history = state.get("chat_history", [])
-
-        # 1. 拼凑上下文
-        context_str = "\n\n".join([f"---片段---\n{n.get_content()}" for n in nodes])
         
-        # 2. 构造 Prompt
-        system_msg = ChatMessage(role="system", content="你是一个专业的计算机课程助教。请根据提供的教材片段回答问题。如果片段中没有答案，请诚实告知。")
-        user_msg = ChatMessage(role="user", content=f"参考资料：\n{context_str}\n\n用户问题：{final_question}")
+        # 1. 精细化构建 Context (核心修改点) 🆕
+        context_list = []
+        for n in nodes:
+            # 尝试获取页码 (LlamaParse 通常存为 'page_label')
+            # 如果是 Web 搜索结果，metadata 可能为空，我们做个兼容
+            meta = n.metadata or {}
+            page = meta.get("page_label", "未知页")
+            file_name = meta.get("file_name", "教材")
+            
+            # 根据来源类型，生成不同的引用标签
+            if source_type == "web":
+                # Web 结果通常在 TextNode 里已经包含 URL，这里可以简化
+                source_tag = "[Web]" 
+            else:
+                # 本地结果：[教材名称 P12]
+                source_tag = f"[{file_name} P{page}]"
+            
+            # 拼接到文本前，让 LLM 知道这段话的出处
+            text = n.get_content()
+            context_list.append(f"---来源 {source_tag}---\n{text}")
+
+        context_str = "\n\n".join(context_list)
         
-        messages = [system_msg] + history + [user_msg]
-
-        response_stream = await llm.astream_chat(messages)
-
+        # 2. 构造带“强制引用指令”的 Prompt 🆕
+        system_prompt = (
+            f"你是一个严谨的计算机课程助教。请基于{source_type}资料回答问题。\n"
+            "【严格引用要求】：\n"
+            "1. 你的回答必须建立在参考资料的基础上，不要编造，不能自己编写，只能从给出的文本中总结回答。\n"
+            "2. **关键步骤**：在引用某个知识点时，请在句尾标注其来源页码，格式严格为 [教材 Pxx] 或 [Web]。\n"
+            "   - 错误示例：...死锁的定义(P12)。\n"
+            "   - 正确示例：...死锁是指两个进程互相等待 [计算机组成原理.pdf P12]。\n"
+            "3. 如果不同段落来自不同页码，请分别标注。\n"
+        )
+        
+        system_msg = ChatMessage(role="system", content=system_prompt)
+        # 使用原始问题 original_question 以保证准确性
+        user_msg = ChatMessage(role="user", content=f"参考资料：\n{context_str}\n\n用户问题：{state['original_question']}")
+        
+        response_stream = await llm.astream_chat([system_msg] + state.get("chat_history", []) + [user_msg])
+        
         return {"final_response": response_stream}
     
     # 当全网都搜不到时，体面地结束
