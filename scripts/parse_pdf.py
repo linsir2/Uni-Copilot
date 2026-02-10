@@ -282,6 +282,7 @@ async def main(pdf_path_str: str, force_recreate: bool = True):
         max_concurrency=5
     )
     documents = await parser.parse()
+    documents = documents[10:15]
     print(f"✅ Parsing complete. Acquired {len(documents)} page-level documents.")
 
     # 3. Init Embeddings & LLM

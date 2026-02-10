@@ -58,8 +58,9 @@ class LocalPDFParser:
                  alias_map_file="../data/global_alias_map.json",
                  use_vlm=True, 
                  max_concurrency=5,
-                 min_image_bytes=3072,
+                 min_image_bytes=6144,
                  max_edge_size=1600,
+                 min_edge_size=220,
                  jpeg_quality=85):
         
         self.pdf_path = Path(pdf_path)
@@ -75,10 +76,11 @@ class LocalPDFParser:
         
         # Configuration
         self.use_vlm = use_vlm
-        self.model_name = "qwen-vl-plus" 
+        self.model_name = "qwen-vl-plus-2025-08-15" 
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.min_image_bytes = min_image_bytes
         self.max_edge_size = max_edge_size
+        self.min_edge_size = min_edge_size
         self.jpeg_quality = jpeg_quality
 
         # [Check] Validate API Key immediately. Degrade gracefully if missing.
@@ -438,13 +440,13 @@ class LocalPDFParser:
             "You are an expert Teaching Assistant. Analyze this image for **Knowledge Graph Construction** and **Exam Review**.\n"
             "Your tasks: 1. Filter Noise 2. Extract Structured Knowledge.\n\n"
             "**Step 1: Classification**\n"
-            "- 'NOISE': Logos, page numbers, decorative headers/footers, blurry icons, pure background.\n"
+            "- 'NOISE': Logos, page numbers, decorative headers/footers, blurry icons, pure background, watermarks, generic clip art, silhouettes, stock photos with no educational value.\n"
             "- 'ARCH': System architecture, block diagrams.\n"
             "- 'FLOW': Algorithms, flowcharts, sequence diagrams.\n"
             "- 'CODE': Code snippets, terminal outputs.\n"
             "- 'FORMULA': Mathematical equations (highly important).\n"
             "- 'CHART/TABLE': Data visualizations.\n"
-            "- 'OTHER': Meaningful illustrations.\n\n"
+            "- 'OTHER': Only for meaningful illustrations that directly explain a CS concept (e.g., a photo of a server rack). If it's just a decorative icon, classify as NOISE.\n\n"
             "**Step 2: Output JSON**\n"
             "```json\n"
             "{\n"
@@ -490,6 +492,21 @@ class LocalPDFParser:
                         if text:
                             json_data = self._extract_json(text)
                             result_type = json_data.get("type", "UNKNOWN")
+
+                            ban_words = {"silhouette", "logo", "icon", "watermark", "copyright", "advertisement", "stock photo", "decorative"}
+                            
+                            # check the dense_caption
+                            caption_lower = json_data.get("dense_caption", "").lower()
+                            # check the keywords
+                            keywords_lower = {k.lower() for k in json_data.get("keywords", [])}
+                            
+                            # 如果包含违禁词，直接降级为 NOISE
+                            if any(w in caption_lower for w in ban_words) or any(w in keywords_lower for w in ban_words):
+                                logger.info(f"🗑️ Heuristic Filter: Forced NOISE for img={img_hash[:8]} (detected '{ban_words & (keywords_lower | {caption_lower})}')")
+                                result_type = "NOISE"
+                                json_data["type"] = "NOISE"
+                                json_data["entities"] = []
+                                json_data["relations"] = []
 
                             if result_type in self.VALID_TYPES or result_type == "UNKNOWN":
                                 self.cache_data[img_hash] = json_data
@@ -575,7 +592,8 @@ class LocalPDFParser:
                     img_bytes = base_image["image"]
                     
                     w, h = base_image.get("width", 0), base_image.get("height", 0)
-                    if len(img_bytes) < self.min_image_bytes or w < 150 or h < 150: continue
+                    if len(img_bytes) < self.min_image_bytes or w < self.min_edge_size or h < self.min_edge_size: 
+                        continue
 
                     aspect_ratio = w / h
                     if aspect_ratio > 8 or aspect_ratio < 0.15: continue
