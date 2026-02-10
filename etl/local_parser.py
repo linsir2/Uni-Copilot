@@ -7,16 +7,45 @@ from pathlib import Path
 from http import HTTPStatus
 from llama_index.core import Document
 import asyncio
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import base64
 import hashlib
-import math
 import tempfile
-import time
 import io
 from PIL import Image
 from collections import Counter
+import logging
+import numpy as np
+
+# Configure Logging (English Standard for Open Source)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("UniCopilotParser")
+
+
+"""
+SIDECAR SCHEMA (page_heavy_data.json)
+-------------------------------------
+{
+    "file_name_p1": {
+        "graph_data": {
+            "entities": [{"name": str, "category": str, ...}],
+            "relations": [{"source": str, "target": str, "relation": str}]
+        },
+        "evidence_images": [
+            {"path": str, "bbox": list, "type": str, "caption": str}
+        ],
+        "raw_text_len": int
+    },
+    ...
+}
+
+Why Sidecar?
+1. Vector Efficiency: Keeps vector store payloads small for faster retrieval.
+2. Evidence Traceability: Allows UI to fetch original image crops via BBox.
+3. Graph Portability: Simplifies export to Neo4j or other GraphDBs.
+"""
+
 
 class LocalPDFParser:
     def __init__(self, 
@@ -24,8 +53,9 @@ class LocalPDFParser:
                  image_output_dir="../data/parsed_images", 
                  cache_file="../data/vlm_cache.json", 
                  hash_record_file="../data/processed_hashes.json",
-                 # [新增] Sidecar 文件路径，用于存放原本要把 metadata 撑爆的重型数据
                  sidecar_file="../data/page_heavy_data.json",
+                 embedding_cache_file="../data/embedding_cache.json",
+                 alias_map_file="../data/global_alias_map.json",
                  use_vlm=True, 
                  max_concurrency=5,
                  min_image_bytes=3072,
@@ -35,55 +65,88 @@ class LocalPDFParser:
         self.pdf_path = Path(pdf_path)
         self.image_output_dir = Path(image_output_dir)
         self.image_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Persistence Paths
         self.cache_file = Path(cache_file)
         self.hash_record_file = Path(hash_record_file)
-        self.sidecar_file = Path(sidecar_file) # [新增]
+        self.sidecar_file = Path(sidecar_file)
+        self.embedding_cache_file = Path(embedding_cache_file)
+        self.alias_map_file = Path(alias_map_file)
         
+        # Configuration
         self.use_vlm = use_vlm
         self.model_name = "qwen-vl-plus" 
         self.semaphore = asyncio.Semaphore(max_concurrency)
-
         self.min_image_bytes = min_image_bytes
         self.max_edge_size = max_edge_size
         self.jpeg_quality = jpeg_quality
 
+        # [Check] Validate API Key immediately. Degrade gracefully if missing.
+        self.api_key = os.getenv("DASHSCOPE_API_KEY")
+        if (self.use_vlm) and not self.api_key:
+            logger.warning("⚠️ DASHSCOPE_API_KEY not found. VLM and Embeddings will be DISABLED.")
+            self.use_vlm = False
+
+        # Load Persistent State
         self.cache_data = self._load_json(self.cache_file)
         self.global_processed_imgs = set(self._load_json(self.hash_record_file).get("hashes", []))
-        
-        # [新增] 加载或初始化 heavy data store
         self.page_heavy_data = self._load_json(self.sidecar_file)
+        self.embedding_map = self._load_json(self.embedding_cache_file)
+        
+        # Load learned aliases (e.g., "CPU" -> "Central Processing Unit")
+        self.global_alias_map: Dict[str, str] = self._load_json(self.alias_map_file)
+
+        self.VALID_TYPES = {"ARCH", "FLOW", "CODE", "FORMULA", "CHART", "TABLE", "OTHER"}
 
     def _load_json(self, path: Path) -> Dict:
         if path.exists():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to load {path}: {e}")
                 return {}
         return {}
     
     def _save_data(self):
-        """保存所有状态数据"""
+        """Atomic write for all state files to prevent corruption during concurrency."""
         self._atomic_write(self.cache_file, self.cache_data)
         self._atomic_write(self.hash_record_file, {"hashes": list(self.global_processed_imgs)})
-        self._atomic_write(self.sidecar_file, self.page_heavy_data) # [新增]
+        self._atomic_write(self.sidecar_file, self.page_heavy_data)
+        self._atomic_write(self.embedding_cache_file, self.embedding_map)
+        self._atomic_write(self.alias_map_file, self.global_alias_map)
 
     def _atomic_write(self, path: Path, data: Any):
+        """
+    Performs a thread-safe and crash-safe atomic write to a JSON file.
+    
+    This method prevents data corruption by writing to a temporary file 
+    first and then replacing the target file in a single OS-level operation.
+    
+    Args:
+        path (Path): The target file path where data should be saved.
+        data (Any): The serializable Python object (dict/list) to be stored.
+        
+    Note:
+        Atomic writes are critical for Sidecar files to ensure that even 
+        if the process is interrupted, the existing data remains intact.
+    """
+        tmp_path = None
         try:
-            # 确保父目录存在
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, text=True)
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
         except Exception as e:
-            if os.path.exists(tmp_path): os.remove(tmp_path)
-            print(f"⚠️ 数据保存失败 {path.name}: {e}")
+            if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
+            logger.error(f"⚠️ Data save failed {path.name}: {e}")
 
-    # ... (中间的 _compute_semantic_hash, _resize, _table_to_markdown, _extract_json 保持不变，省略以节省空间) ...
+    # --- Image Processing Helpers ---
     def _compute_semantic_hash(self, img_bytes: bytes) -> str:
         try:
             with Image.open(io.BytesIO(img_bytes)) as img:
+                # Convert to Grayscale & Resize to ensure hash stability across PDF renders
                 img = img.convert("L").resize((256, 256), Image.Resampling.LANCZOS)
                 return hashlib.sha256(img.tobytes()).hexdigest()
         except Exception:
@@ -103,198 +166,457 @@ class LocalPDFParser:
         except Exception:
             return img_bytes
 
+    # --- Text Processing Helpers ---
     def _table_to_markdown(self, table):
         if not table or len(table) < 1: return ""
         cleaned = [[str(cell).replace('\n', ' ') if cell is not None else "" for cell in row] for row in table]
+        if not cleaned: return ""
         header = "| " + " | ".join(cleaned[0]) + " |"
         sep = "| " + " | ".join(["---"] * len(cleaned[0])) + " |"
-        rows = ["| " + " | ".join(r) + " |" for r in cleaned[1:]]
-        return f"\n\n{header}\n{sep}\n" + "\n".join(rows) + "\n\n"
-
+        if len(cleaned) > 1:
+            rows = ["| " + " | ".join(r) + " |" for r in cleaned[1:]]
+            return f"\n\n{header}\n{sep}\n" + "\n".join(rows) + "\n\n"
+        return f"\n\n{header}\n{sep}\n\n"
+    
     def _extract_json(self, text: str) -> Dict:
+        """Robust JSON extraction from LLM response"""
+        text = text.strip()
         try: return json.loads(text)
-        except: pass
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+        except json.JSONDecodeError: pass
+
+        # Fallback 1: Regex
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
         if match:
             try: return json.loads(match.group(1))
             except: pass
+        
+        # Fallback 2: Brute force braces
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            try: return json.loads(text[start:end+1])
+            except: pass
+
         return {"dense_caption": text, "entities": [], "relations": [], "keywords": [], "type": "UNKNOWN"}
 
-    def _extract_text_keywords(self, text: str, top_k: int = 5) -> List[str]:
-        keywords = []
+    def _extract_text_keywords(self, text: str, top_k: int = 15) -> List[str]:
+        """
+        Extracts the most significant keywords from the text using title 
+        analysis and technical term frequency.
+        
+        Args:
+            text (str): The raw text of the page.
+            top_k (int): Maximum number of unique keywords to return.
+            
+        Returns:
+            List[str]: A ranked list of key terms for metadata indexing.
+        """
+        keywords_pool = []
         if not text: return []
+        
+        # 1. Title Priority: The section title is the strongest semantic anchor.
         title = self._extract_section_title(text)
         if title:
+            # Strip numbering (e.g., "1.2.3") to get the clean topic name
             clean = re.sub(r"^[\d\.]+\s*|第[一二三四五六七八九十\d]+[章节]\s*", "", title).strip()
-            if clean: keywords.append(clean)
+            if clean: 
+                # Give the title a high frequency boost (weighted 5 times)
+                keywords_pool.extend([clean] * 5)
+        
+        # 2. Technical Term Extraction: Capture capitalized CS terms (e.g., CPU, RAM).
+        # regex matches words starting with uppercase and containing alphanumeric/underscores.
         english_terms = re.findall(r'\b[A-Z][A-Za-z0-9_]{1,}\b', text)
         if english_terms:
-            STOP_WORDS = {'THE', 'AND', 'FOR', 'FIG', 'TABLE', 'PAGE', 'SECTION'}
+            # Filter non-informative common words
+            STOP_WORDS = {'THE', 'AND', 'FOR', 'FIG', 'TABLE', 'PAGE', 'SECTION', 'CHAPTER', 'IMAGE', 'FIGURE'}
             filtered = [t for t in english_terms if t.upper() not in STOP_WORDS and len(t) > 1]
-            keywords.extend(filtered)
-        return keywords
+            keywords_pool.extend(filtered)
+        
+        # 3. Frequency Ranking: Use Counter to find the most representative terms.
+        # This prevents metadata bloating and filters out one-off noise.
+        counts = Counter(keywords_pool)
+        
+        # Extract the top_k most frequent terms
+        top_results = [word for word, count in counts.most_common(top_k)]
+        
+        return top_results
 
     def _sanitize_canonical_name(self, name: str, canonical: str) -> str:
+        """Sanitize names to prevent LLM hallucination length issues"""
         if not canonical: return name
         clean_can = canonical.strip()
         clean_name = name.strip()
+        # Reject if canonical is too long or looks like a sentence
         if len(clean_can) > 40 or len(clean_can) > len(clean_name) * 4: return clean_name
         if " " in clean_can:
             words = clean_can.split()
             if len(set(words)) < len(words) * 0.5: return clean_name
         return clean_can
 
-    def _dedup_graph_data(self, entities: List[Dict], relations: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        unique_entities = []
-        seen_entities = set()
-        alias_map = {} 
-        for e in entities:
-            name = e.get("name", "").strip()
-            raw_canonical = e.get("canonical_name", "").strip()
-            category = e.get("category", "").strip()
-            if not name: continue
-            final_name = self._sanitize_canonical_name(name, raw_canonical)
-            alias_map[name.upper()] = final_name
-            if raw_canonical: alias_map[raw_canonical.upper()] = final_name
-            key = (final_name.upper(), category.upper())
-            if key not in seen_entities:
-                seen_entities.add(key)
-                e["name"] = final_name 
-                unique_entities.append(e)
-        unique_relations = []
-        seen_relations = set()
-        for r in relations:
-            src = r.get("source", "").strip()
-            tgt = r.get("target", "").strip()
-            rel = r.get("relation", "").strip()
-            if not src or not tgt: continue
-            final_src = alias_map.get(src.upper(), src)
-            final_tgt = alias_map.get(tgt.upper(), tgt)
-            r["source"] = final_src
-            r["target"] = final_tgt
-            key = (final_src.upper(), final_tgt.upper(), rel.upper())
-            if key not in seen_relations:
-                seen_relations.add(key)
-                unique_relations.append(r)
-        return unique_entities, unique_relations
-
     def _extract_section_title(self, text: str) -> Optional[str]:
         if not text: return None
         for line in text.split('\n')[:5]:
             line = line.strip()
-            if re.match(r"^\d+(\.\d+)*\s+.+", line) or re.match(r"^第[一二三四五六七八九十\d]+[章节].+", line):
+            if len(line) > 60: continue 
+            if re.match(r"^\d+(\.\d+)*\s+.+", line) or \
+               re.match(r"^(Chapter|Section|Part|第[一二三四五六七八九十\d]+[章节])", line, re.IGNORECASE):
                 return line
         return None
 
+    # --- Embedding & Vector Logic ---
+    async def _get_embedding(self, text: str) -> List[float]:
+        # Fast exit if API Key is missing
+        if not self.api_key: return []
+
+        if text in self.embedding_map:
+            return self.embedding_map[text]
+        
+        try:
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: dashscope.TextEmbedding.call(
+                    model=dashscope.TextEmbedding.Models.text_embedding_v2,
+                    input=text,
+                    api_key=self.api_key or ""
+                )
+            )
+            if resp.status_code == HTTPStatus.OK:
+                emb = resp.output['embeddings'][0]['embedding']
+                self.embedding_map[text] = emb 
+                return emb
+            else:
+                logger.warning(f"Embedding API failed for '{text}': {resp.message}")
+        except Exception as e:
+            logger.error(f"Embedding exception for '{text}': {e}")
+        return []
+
+    def _cosine_similarity(self, vec1, vec2):
+        if not vec1 or not vec2: return 0.0
+        # [Safety Check] Dimension mismatch protection
+        if len(vec1) != len(vec2):
+            # Only log error once per run to avoid spamming
+            if not hasattr(self, "_dim_error_logged"):
+                logger.error(f"Dimension mismatch: {len(vec1)} vs {len(vec2)}. Check Embedding Model.")
+                setattr(self, "_dim_error_logged", True)
+            return 0.0
+            
+        v1, v2 = np.array(vec1), np.array(vec2)
+        norm_product = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if norm_product == 0: return 0.0
+        return np.dot(v1, v2) / norm_product
+
+    async def _dedup_graph_data(self, entities: List[Dict], relations: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """
+    Synchronizes local page entities with the global knowledge base using 
+    Hybrid Alignment (String Match + Vector Similarity).
+    
+    This is the "Brain" of the Sidecar pattern, ensuring that "CPU" on Page 1 
+    and "Central Processing Unit" on Page 10 are mapped to the same global ID.
+    
+    Args:
+        entities (List[Dict]): Raw entities extracted from the current page/image.
+        relations (List[Dict]): Raw relations extracted from the current page/image.
+        
+    Returns:
+        Tuple[List[Dict], List[Dict]]: Aligned and deduplicated entities/relations 
+        ready for Sidecar storage and GraphRAG.
+    """
+        unique_entities = []
+        seen_entities = set()
+        
+        # --- 1. Entity Alignment Phase ---
+        for e in entities:
+            name = e.get("name", "").strip()
+            raw_canonical = e.get("canonical_name", "").strip()
+            category = e.get("category", "Concept").strip()
+            
+            if not name or len(name) < 2: continue
+            
+            current_name = self._sanitize_canonical_name(name, raw_canonical)
+            name_key = current_name.upper()
+
+            # A. Fast Path: String Matching
+            if name_key in self.global_alias_map:
+                final_name = self.global_alias_map[name_key]
+            else:
+                # B. Slow Path: Vector Alignment
+                final_name = current_name
+                
+                # Condition: Have API key, have data, and not too many entities (Perf Protection)
+                if self.api_key and len(self.embedding_map) > 0 and len(self.global_alias_map) < 8000:
+                    current_vec = await self._get_embedding(current_name)
+                    
+                    if current_vec:
+                        best_match: str = ""
+                        highest_sim = 0.0
+                        
+                        for existing_name, existing_vec in self.embedding_map.items():
+                            # [Optimization] Skip self
+                            if existing_name == current_name: continue
+                            
+                            # [Pollution Protection] Do not match against long sentences!
+                            if len(existing_name.split()) > 6: continue 
+
+                            sim = self._cosine_similarity(current_vec, existing_vec)
+                            if sim > highest_sim:
+                                highest_sim = sim
+                                best_match = existing_name
+                                # [Early Exit] If match is near-perfect, stop searching
+                                if highest_sim > 0.99: break
+                        
+                        # Threshold: 0.92 is high confidence
+                        if highest_sim > 0.92 and best_match:
+                            logger.info(f"🧬 Semantic Match: '{current_name}' -> '{best_match}' (sim: {highest_sim:.4f})")
+                            final_name = best_match
+                            # Learn this association
+                            self.global_alias_map[name_key] = final_name
+                        else:
+                            # Register new entity
+                            self.global_alias_map[name_key] = current_name
+                    else:
+                        self.global_alias_map[name_key] = current_name
+                else:
+                    self.global_alias_map[name_key] = current_name
+
+            e["name"] = final_name
+            if name != final_name: e["original_name"] = name 
+
+            # We use a composite key (Name + Category) to allow the same name 
+            # to exist as distinct entities if they belong to different categories 
+            # (e.g., 'Cache' as a 'Component' vs 'Cache' as a 'Action').
+            key = (final_name.upper(), category.upper())
+            if key not in seen_entities:
+                seen_entities.add(key)
+                unique_entities.append(e)
+        
+        # --- 2. Relation Alignment Phase ---
+        unique_relations = []
+        seen_relations = set()
+        
+        for r in relations:
+            src = str(r.get("source", "") or "").strip()
+            tgt = str(r.get("target", "") or "").strip()
+            rel = str(r.get("relation", "") or "").strip()
+        
+            if not src or not tgt: continue
+            if src.upper() == tgt.upper(): continue
+
+            # Apply the global alias map to relations too
+            final_src = self.global_alias_map.get(src.upper(), src)
+            final_tgt = self.global_alias_map.get(tgt.upper(), tgt)
+            
+            r["source"] = final_src
+            r["target"] = final_tgt
+            
+            if "weight" not in r: r["weight"] = 1.0
+
+            key = (final_src.upper(), final_tgt.upper(), rel.upper())
+            if key not in seen_relations:
+                seen_relations.add(key)
+                unique_relations.append(r)
+                
+        return unique_entities, unique_relations
+
+    # --- VLM Interaction ---
     async def _describe_image_with_retry(self, img_bytes: bytes, img_hash: str):
-        if img_hash in self.cache_data: return self.cache_data[img_hash]
+        if img_hash in self.cache_data: 
+            cached = self.cache_data[img_hash]
+            if cached.get("type") in ["FAILED", "NOISE"]:
+                return None
+            # [Fix] Return cached 'UNKNOWN' to prevent infinite retry loops
+            if cached.get("type") in self.VALID_TYPES or cached.get("type") == "UNKNOWN":
+                return cached
+            
         if not self.use_vlm: return None
+
         processed_bytes = self._resize_and_compress_image(img_bytes)
         b64_data = base64.b64encode(processed_bytes).decode('utf-8')
         img_data_uri = f"data:image/jpeg;base64,{b64_data}"
+        
+        # System Prompt optimized for GraphRAG
         system_prompt = (
-            "你是一个计算机组成原理课程的专家助教。请分析这张图片，为**向量检索**和**知识图谱构建**分别生成内容。\n"
-            "请严格输出符合以下 Schema 的 JSON 格式：\n"
+            "You are an expert Teaching Assistant. Analyze this image for **Knowledge Graph Construction** and **Exam Review**.\n"
+            "Your tasks: 1. Filter Noise 2. Extract Structured Knowledge.\n\n"
+            "**Step 1: Classification**\n"
+            "- 'NOISE': Logos, page numbers, decorative headers/footers, blurry icons, pure background.\n"
+            "- 'ARCH': System architecture, block diagrams.\n"
+            "- 'FLOW': Algorithms, flowcharts, sequence diagrams.\n"
+            "- 'CODE': Code snippets, terminal outputs.\n"
+            "- 'FORMULA': Mathematical equations (highly important).\n"
+            "- 'CHART/TABLE': Data visualizations.\n"
+            "- 'OTHER': Meaningful illustrations.\n\n"
+            "**Step 2: Output JSON**\n"
             "```json\n"
             "{\n"
-            "  \"type\": \"(ARCH | FLOW | CODE | FORMULA | CHART | TABLE | OTHER)\",\n"
-            "  \"dense_caption\": \"详细的自然语言描述，包含核心概念、数据流向和文字信息。\",\n"
-            "  \"keywords\": [\"关键词1\", \"关键词2\"],\n"
-            "  \"entities\": [{\"name\": \"如 ALU\", \"canonical_name\": \"如 Arithmetic Logic Unit\", \"category\": \"Component\"}],\n"
-            "  \"relations\": [{\"source\": \"A\", \"target\": \"B\", \"relation\": \"FLOWS_TO\", \"description\": \"描述\"}],\n"
-            "  \"ocr_text\": \"提取图中所有可见文字\"\n"
+            "  \"type\": \"(ARCH | FLOW | CODE | FORMULA | CHART | TABLE | OTHER | NOISE)\",\n"
+            "  \"dense_caption\": \"Detailed description. For ARCH/FLOW, describe the data flow. For FORMULA, provide LaTeX.\",\n"
+            "  \"keywords\": [\"key1\", \"key2\"],\n"
+            "  \"entities\": [\n"
+            "    {\"name\": \"Concept Name\", \"canonical_name\": \"Full Name (no abbr)\", \"category\": \"(Component|Algorithm|Metric|Concept)\"}\n"
+            "  ],\n"
+            "  \"relations\": [\n"
+            "    {\"source\": \"A\", \"target\": \"B\", \"relation\": \"(INCLUDES|FLOWS_TO|CALCULATES|DEPENDS_ON)\", \"description\": \"context\"}\n"
+            "  ],\n"
+            "  \"ocr_text\": \"Exact text in the image\"\n"
             "}\n"
             "```\n"
-            "Canonical Name 用于消歧。无信息量返回: {\"type\": \"NONE\"}"
+            "Constraint: If type is NOISE, return empty lists for entities/relations."
         )
+        
         messages = [{"role": "user", "content": [{"image": img_data_uri}, {"text": system_prompt}]}]
+        
         async with self.semaphore:
             for attempt in range(3):
                 try:
-                    response = await asyncio.get_event_loop().run_in_executor(None, lambda: dashscope.MultiModalConversation.call(model=self.model_name, messages=messages, api_key=os.getenv("DASHSCOPE_API_KEY") or ""))
-                    if response.status_code == HTTPStatus.OK: # type: ignore
-                        content = response.output.choices[0].message.content # type: ignore
-                        text = content[0]['text'] if isinstance(content, list) else str(content)
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None, 
+                        lambda: dashscope.MultiModalConversation.call(
+                            model=self.model_name, 
+                            messages=messages, 
+                            api_key=self.api_key or ""
+                        )
+                    )
+
+                    from typing import Any, cast
+                    valid_resp = cast(Any, response)
+
+                    if valid_resp.status_code == HTTPStatus.OK:
+                        content = valid_resp.output.choices[0].message.content
+                        if isinstance(content, list):
+                            text = "\n".join(c.get("text","") for c in content if isinstance(c, dict))
+                        else:
+                            text = str(content)
+                            
                         if text:
                             json_data = self._extract_json(text)
-                            if json_data.get("type") != "NONE":
+                            result_type = json_data.get("type", "UNKNOWN")
+
+                            if result_type in self.VALID_TYPES or result_type == "UNKNOWN":
                                 self.cache_data[img_hash] = json_data
                                 return json_data
-                        return None
-                except Exception:
+                            elif result_type == "NOISE":
+                                self.cache_data[img_hash] = json_data
+                                return None
+                    else:
+                        logger.warning(f"API Error: {valid_resp.code} - {valid_resp.message}")
+
+                except Exception as e:
+                    logger.warning(f"[VLM ERROR] img={img_hash[:8]} attempt={attempt+1} err={e}")
                     if attempt < 2: await asyncio.sleep(2 ** attempt)
+            
+            # Persist failure to avoid retrying on next run
+            self.cache_data[img_hash] = {"type": "FAILED"}
             return None
 
+    # --- Main Pipeline ---
     async def parse(self) -> List[Document]:
-        print(f"🐢 [PageFirstParser v1.7 Sidecar] 开始解析: {self.pdf_path.name}")
+        """
+    The main pipeline that converts a PDF into slim Vector Documents and 
+    heavy Sidecar Metadata.
+    
+    Sidecar Implementation Flow:
+    1. Extracts text and tables via PDFPlumber.
+    2. Extracts images and processes them through VLM (Qwen-VL).
+    3. Bundles Graph Data (entities/relations) and Image Evidence into a 
+       Sidecar dictionary keyed by 'page_id'.
+    4. Generates LlamaIndex Documents containing only text and the Sidecar Key.
+    5. Triggers _save_data() to persist all learned metadata.
+    
+    Returns:
+        List[Document]: A list of LlamaIndex Document objects with slim metadata.
+    """
+        
+        logger.info(f"🐢 [Uni-Copilot Parser] Starting: {self.pdf_path.name}")
         pages_content: Dict[int, Dict[str, Any]] = {}
         all_image_tasks = []
-        doc_fitz = fitz.open(self.pdf_path)
-        total_pages = len(doc_fitz)
+        
+        try:
+            doc_fitz = fitz.open(self.pdf_path)
+            total_pages = len(doc_fitz)
+        except Exception as e:
+            logger.error(f"Failed to open PDF {self.pdf_path}: {e}")
+            return []
 
         for i in range(total_pages):
             pages_content[i] = {'raw_text': "", 'text_parts': [], 'graph_entities': [], 'graph_relations': [], 'page_keywords': [], 'image_meta': [], 'evidence_images': []}
 
-        print("    📖 正在提取文本与表格...")
+        logger.info("    📖 Extracting text and tables...")
+        
         def extract_text():
-            with pdfplumber.open(self.pdf_path) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    text = page.extract_text()
-                    if text:
-                        pages_content[i]['raw_text'] = text
-                        pages_content[i]['text_parts'].append(text)
-                    for idx, tbl in enumerate(page.extract_tables()):
-                        md = self._table_to_markdown(tbl)
-                        if md: pages_content[i]['text_parts'].append(f"\n=== 表格 {idx+1} ===\n{md}")
+            try:
+                with pdfplumber.open(self.pdf_path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        if i >= total_pages: break
+                        text = page.extract_text()
+                        if text:
+                            pages_content[i]['raw_text'] = text
+                            pages_content[i]['text_parts'].append(text)
+                        
+                        tables = page.extract_tables()
+                        for idx, tbl in enumerate(tables):
+                            md = self._table_to_markdown(tbl)
+                            if md: pages_content[i]['text_parts'].append(f"\n=== Table {idx+1} ===\n{md}")
+            except Exception as e:
+                logger.error(f"PDFPlumber error: {e}")
+
         await asyncio.get_event_loop().run_in_executor(None, extract_text)
 
-        print("    🖼️ 正在提取图片...")
+        logger.info("    🖼️ Extracting images...")
         for i in range(total_pages):
             page_fitz = doc_fitz[i]
             image_list = page_fitz.get_images(full=True)
+
             for img_idx, img in enumerate(image_list):
-                xref = img[0]
-                rects = page_fitz.get_image_rects(xref)
-                bbox = [float(x) for x in rects[0]] if rects else []
-                base_image = doc_fitz.extract_image(xref)
-                img_bytes = base_image["image"]
-                
-                w, h = base_image.get("width", 0), base_image.get("height", 0)
-                img_len = len(img_bytes)
-                if len(img_bytes) < self.min_image_bytes or w < 200 or h < 200: continue
+                try:
+                    xref = img[0]
+                    rects = page_fitz.get_image_rects(xref)
+                    bbox = [float(x) for x in rects[0]] if rects else []
+                    base_image = doc_fitz.extract_image(xref)
+                    img_bytes = base_image["image"]
+                    
+                    w, h = base_image.get("width", 0), base_image.get("height", 0)
+                    if len(img_bytes) < self.min_image_bytes or w < 150 or h < 150: continue
 
-                aspect_ratio = w / h
-                if aspect_ratio > 5 or aspect_ratio < 0.2:
-                    continue
+                    aspect_ratio = w / h
+                    if aspect_ratio > 8 or aspect_ratio < 0.15: continue
 
-                byte_density = img_len / (w * h)
-                if byte_density < 0.05:
-                    continue
+                    img_hash = self._compute_semantic_hash(img_bytes)
+                    img_ext = base_image["ext"]
+                    img_path = self.image_output_dir / f"p{i+1}_{img_idx}_{img_hash[:8]}.{img_ext}"
+                
+                    if not img_path.exists(): 
+                        with open(img_path, "wb") as f: f.write(img_bytes)
+                
+                    task = self._describe_image_with_retry(img_bytes, img_hash)
+                    all_image_tasks.append(task)
 
-                if img_len < 10240:
-                    continue
-                
-                img_hash = self._compute_semantic_hash(img_bytes)
-                img_ext = base_image["ext"]
-                img_path = self.image_output_dir / f"p{i+1}_{img_idx}_{img_hash[:8]}.{img_ext}"
-                if not img_path.exists(): 
-                    with open(img_path, "wb") as f: f.write(img_bytes)
-                
-                all_image_tasks.append(self._describe_image_with_retry(img_bytes, img_hash))
-                pages_content[i]['image_meta'].append({"task_idx": len(all_image_tasks)-1, "path": str(img_path), "bbox": bbox, "hash": img_hash, "local_idx": img_idx})
+                    pages_content[i]['image_meta'].append({
+                            "task_idx": len(all_image_tasks)-1, 
+                            "path": str(img_path), 
+                            "bbox": bbox, 
+                            "hash": img_hash, 
+                            "local_idx": img_idx
+                        })
+                except Exception as e:
+                    logger.warning(f"Image extract error p{i}: {e}")
         doc_fitz.close()
 
         image_results: List[Any] = [None] * len(all_image_tasks)
         if all_image_tasks:
-            print(f"    🚀 正在处理 {len(all_image_tasks)} 张图片...")
-            for i in range(0, len(all_image_tasks), 5):
-                batch = all_image_tasks[i:i+5]
-                results = await asyncio.gather(*batch, return_exceptions=True)
-                for j, res in enumerate(results): image_results[i+j] = res
-                if i+5 < len(all_image_tasks): await asyncio.sleep(1.0)
+            logger.info(f"    🚀 Processing {len(all_image_tasks)} images...")
+            # [Fix] Use simple gather with semaphore throttling inside task.
+            results = await asyncio.gather(*all_image_tasks, return_exceptions=True)
+            
+            for j, res in enumerate(results): 
+                if isinstance(res, Exception):
+                    logger.error(f"Task failed: {res}")
+                    image_results[j] = None
+                else:
+                    image_results[j] = res
 
         final_documents = []
-        current_section_title = "未知章节"
+        current_section_title = "General"
+
         for i in range(total_pages):
             page_data = pages_content[i]
             title = self._extract_section_title(page_data['raw_text'])
@@ -305,38 +627,61 @@ class LocalPDFParser:
 
             for meta in page_data['image_meta']:
                 res = image_results[meta['task_idx']]
-                if isinstance(res, Exception) or not res or res.get("type") == "NONE": continue
+                if isinstance(res, Exception) or not res: continue
+
+                if res.get("type") in ["NOISE", "NONE", "UNKNOWN", "FAILED"]:
+                    continue
                 
-                page_data['text_parts'].append(f"\n=== 插图 {meta['local_idx']+1} ({res.get('type')}) ===\n描述: {res.get('dense_caption')}\nOCR: {res.get('ocr_text')}\n")
-                if res.get("keywords"): page_data['page_keywords'].extend(res.get("keywords"))
+                caption_block = (
+                    f"\n>>> [IMAGE: {res.get('type')}]\n"
+                    f"Caption: {res.get('dense_caption')}\n"
+                    f"OCR: {res.get('ocr_text')}\n"
+                    f"<<<\n"
+                )
+                page_data['text_parts'].append(caption_block)
+
+                # [Correction] Limit image keywords to Top 3 to prevent bias
+                if res.get("keywords"): 
+                    page_data['page_keywords'].extend(res.get("keywords")[:3])
                 
                 if meta['hash'] not in self.global_processed_imgs:
                     self.global_processed_imgs.add(meta['hash'])
+
                     if res.get("entities"):
                         for e in res.get("entities"): e.update({"source": "image", "page": i+1})
                         page_data['graph_entities'].extend(res.get("entities"))
+                    
                     if res.get("relations"):
                         for r in res.get("relations"): r.update({"provenance": "image", "page": i+1})
                         page_data['graph_relations'].extend(res.get("relations"))
                 
-                page_data['evidence_images'].append({"path": meta['path'], "bbox": meta['bbox'], "type": res.get("type")})
+                page_data['evidence_images'].append({
+                    "path": meta['path'], 
+                    "bbox": meta['bbox'], 
+                    "type": res.get("type"),
+                    "caption": res.get("dense_caption")
+                })
 
             kw_counter = Counter(page_data['page_keywords'])
             top_kws = [k for k, v in kw_counter.most_common(15)]
             keywords_str = ", ".join(top_kws)
             
-            full_text = f"[SECTION] {current_section_title}\n[KEYWORDS] {keywords_str}\n=== 第 {i+1} 页 ===\n" + "\n".join(page_data['text_parts'])
+            full_text = (
+                f"[SECTION] {current_section_title}\n"
+                f"[KEYWORDS] {keywords_str}\n"
+                f"=== Page {i+1} ===\n" 
+                + "\n".join(page_data['text_parts'])
+            )
             
-            u_ents, u_rels = self._dedup_graph_data(page_data['graph_entities'], page_data['graph_relations'])
+            # Async Deduplication
+            u_ents, u_rels = await self._dedup_graph_data(page_data['graph_entities'], page_data['graph_relations'])
             
-            # [关键修复] Sidecar Pattern: Metadata 瘦身
-            # 生成一个唯一的 page_id
             page_id = f"{self.pdf_path.name}_p{i+1}"
             
-            # 将“重数据”存入 Sidecar 字典，而不是 Document
             self.page_heavy_data[page_id] = {
                 "graph_data": {"entities": u_ents, "relations": u_rels},
-                "evidence_images": page_data['evidence_images']
+                "evidence_images": page_data['evidence_images'],
+                "raw_text_len": len(page_data['raw_text'])
             }
 
             final_documents.append(Document(
@@ -346,12 +691,13 @@ class LocalPDFParser:
                     "page_label": str(i+1), 
                     "section_title": current_section_title,
                     "content_type": "page_compound",
-                    "page_id_key": page_id  # 只留一个索引 Key
+                    "page_id_key": page_id, 
+                    "has_images": len(page_data['evidence_images']) > 0
                 }
             ))
 
-        self._save_data() # 保存 sidecar 文件
-        print(f"✅ 解析完成！生成 {len(final_documents)} 个瘦身版文档片段。")
+        self._save_data()
+        logger.info(f"✅ Parsing complete! Generated {len(final_documents)} slim document chunks.")
         return final_documents
 
 async def load_pdf_locally(pdf_path):

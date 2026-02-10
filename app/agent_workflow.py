@@ -1,71 +1,85 @@
+import os
+import httpx # [Fix 1] Use Async Client
 from typing import TypedDict, List, Any
 from langgraph.graph import StateGraph, END
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.llms import ChatMessage
-import os
-import requests
-
 
 class AgentState(TypedDict):
-    question: str # 当前的问题（可能是被重写过的版本）
-    original_question: str # 最开始用户问的问题（没被llm修改过的版本）；用于最后llm生成回答
+    question: str 
+    original_question: str 
     chat_history: List[ChatMessage]
     retrieved_nodes: List[NodeWithScore]
-    grade_status: str # "yes" or "no"
+    grade_status: str 
     retry_count: int
     final_response: Any
-    source: str # local or web
+    source: str # 'local' or 'web'
 
 def create_graph_app(retriever, llm):
     """构建并编译 LangGraph 工作流"""
-    # 辅助工具：构造评分prompt
+
+    # --- 辅助：构造评分 Prompt ---
     def get_grader_prompt(question, context):
         return (
-            f"你是一名评分员。请评估以下检索到的教材片段是否与用户的问题相关。\n"
+            f"你是一名严格的评分员。请评估以下检索到的教材片段是否包含回答用户问题所需的信息。\n"
             f"问题: {question}\n\n"
             f"教材片段:\n{context}\n\n"
-            f"如果片段包含能回答问题的关键词或语义，请回复 'yes'，否则回复 'no'。\n"
-            f"只回复 'yes' 或 'no'，不要废话。"
+            f"评判标准：\n"
+            f"1. 片段必须包含具体的定义、解释或数据。\n"
+            f"2. 如果片段只是提到了关键词但没解释（如目录、索引），判为 no。\n"
+            f"3. 即使只有部分相关，只要有用，判为 yes。\n\n"
+            f"请只回复 'yes' 或 'no'。"
         )
     
-    def tavily_search(query: str):
+    # --- 辅助：异步 Tavily 搜索 ---
+    async def tavily_search(query: str):
         api_key = os.getenv("TAVILY_API_KEY")
         if not api_key:
-            print("⚠️ 未配置 TAVILY_API_KEY，跳过联网搜索。")
+            print("⚠️ [Tavily] 未配置 API Key，跳过。")
             return []
         
-        print(f"🌍 [Tavily] 正在搜索互联网: {query}")
+        print(f"🌍 [Tavily] 正在异步搜索: {query}")
         payload = {
             "api_key": api_key,
             "query": query,
-            "search_depth": "advanced",
+            "search_depth": "basic", # 'advanced' is slower, 'basic' is faster
             "include_answer": True,
             "max_results": 3,
         }
 
         try:
-            response = requests.post(
-                url=os.getenv("TAVILY_BASE_URL") or "",
-                json=payload,
-                timeout=20,
-            )
-            data = response.json()
+            # [Fix 1] 使用 httpx 进行异步请求，防止阻塞 FastAPI
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url="https://api.tavily.com/search",
+                    json=payload,
+                    timeout=10.0
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
             nodes = []
-
+            # 1. Tavily 直接生成的 AI 答案
             if data.get("answer"):
                 nodes.append(
                     NodeWithScore(
-                        node=TextNode(text=f"【Tavily 智能摘要】: {data['answer']}"),
+                        node=TextNode(
+                            text=f"【网络智能摘要】: {data['answer']}",
+                            metadata={"file_name": "Web", "page": "AI Summary"}
+                        ),
                         score=1.0,
                     )
                 )
             
+            # 2. 具体的搜索结果
             for result in data.get("results", []):
-                content = f"【来源: {result['title']}】\n{result['content']}\n(URL: {result['url']})"
+                content = f"{result['content']}\n(Source: {result['url']})"
                 nodes.append(
                     NodeWithScore(
-                        node=TextNode(text=content),
+                        node=TextNode(
+                            text=content,
+                            metadata={"file_name": "Web", "page": "Link"}
+                        ),
                         score=0.9,
                     )
                 )
@@ -73,218 +87,153 @@ def create_graph_app(retriever, llm):
             return nodes
         
         except Exception as e:
-            print(f"❌ Tavily 搜索失败: {e}")
+            print(f"❌ Tavily 搜索异常: {e}")
             return []
 
+    # --- Node 1: Retrieve ---
     async def retrieve_node(state: AgentState):
-        print("🔍 [Node] Retrieving...")
+        print("🔍 [Agent] Retrieving...")
         question = state["question"]
         chat_history = state.get("chat_history", [])
 
-        # 如果有历史记录，则进行 Query 压缩/改写
-        if chat_history:
-            history_str = "\n".join([f"{m.role}: {m.content}" for m in chat_history[-3:]]) # 取最近3轮
-            rewrite_prompt = (
-                f"结合以下对话历史，将用户最新的问题改写为一个独立、完整的搜索指令。\n"
-                f"对话历史:\n{history_str}\n"
-                f"当前问题: {question}\n"
-                f"改写后的完整问题（只需输出改写后的文本）:"
+        # Query Rewrite (Simplification)
+        # Only rewrite if we have history and it's not a retry
+        search_query = question
+        if chat_history and state.get("retry_count", 0) == 0:
+            history_txt = "\n".join([f"{m.role}: {m.content}" for m in chat_history[-2:]])
+            prompt = (
+                f"基于对话历史，将用户最新的问题改写为独立的搜索关键词。\n"
+                f"历史: {history_txt}\n问题: {question}\n"
+                f"输出(仅关键词):"
             )
-            # 调用 llm 进行改写
-            rewrite_res = await llm.acomplete(rewrite_prompt)
-            search_query = rewrite_res.text.strip()
-            print(f"   -> 转换后的 Query: {search_query}")
-        else:
-            search_query = question
+            res = await llm.acomplete(prompt)
+            search_query = res.text.strip()
+            print(f"   -> 改写 Query: {search_query}")
 
-        # 使用转换后的 search_query 进行检索
         nodes = await retriever.aretrieve(search_query)
-
-        print(f"   -> 检索到 {len(nodes)} 条相关片段")
+        print(f"   -> 检索到 {len(nodes)} 条")
         return {"retrieved_nodes": nodes, "source": "local", "question": search_query}
     
+    # --- Node 2: Grade ---
     async def grade_node(state: AgentState):
-        print("⚖️ [Agent] 正在评估资料质量...")
         question = state["question"]
         nodes = state["retrieved_nodes"]
 
-        # 1. 如果根本没搜到，直接判死刑
         if not nodes:
             return {"grade_status": "no"}
             
-        # 2. 构造上下文供 LLM 判断
-        # 取前 3 个片段的内容拼接，避免 token 爆炸
-        context_preview = "\n".join([n.get_content()[:200] for n in nodes[:3]])
-
+        # 预览前3条内容用于评分
+        context_preview = "\n".join([n.node.get_content()[:200] for n in nodes[:3]])
         prompt = get_grader_prompt(question, context_preview)
 
-        # 3. 调用 LLM 进行二分类
-        # 这里用 complete 而不是 stream，因为我们要拿结果做判断
         response = await llm.acomplete(prompt)
         score = response.text.strip().lower()
-
-        if "yes" in score:
-            status = "yes"
-        else:
-            status = "no"
+        status = "yes" if "yes" in score else "no"
         
-        print(f"   -> 评分结果: {status}")
+        print(f"⚖️ [Agent] 评分: {status}")
         return {"grade_status": status}
     
+    # --- Node 3: Rewrite (Loop) ---
     async def rewrite_node(state: AgentState):
-        print("🔄 [Agent] 资料不全，正在重写查询词...")
+        print("🔄 [Agent] 重写查询词...")
         question = state["question"]
-
-        prompt = (
-            f"用户的问题是：'{question}'。\n"
-            f"目前的检索结果不佳。请根据语义把这个问题重写得更精准，或者是提取核心关键词。\n"
-            f"只输出重写后的问题，不要解释。"
-        )
-
-        response = await llm.acomplete(prompt)
-        new_question = response.text.strip()
-
-        print(f"   -> 新问题: {new_question}")
+        prompt = f"用户问题 '{question}' 在教材中未搜到。请尝试提取核心实体词，去除修饰词，重写查询。"
+        res = await llm.acomplete(prompt)
+        new_q = res.text.strip()
+        print(f"   -> 新 Query: {new_q}")
         
-        # 更新问题，并增加计数器
         return {
-            "question": new_question, 
+            "question": new_q, 
             "retry_count": state.get("retry_count", 0) + 1
         }
     
+    # --- Node 4: Web Search ---
     async def web_search_node(state: AgentState):
-        print("🌍 [Agent] 本地彻底没戏了，启动 Deep Research (Tavily)...")
-        query = state["original_question"]
-
-        web_nodes = tavily_search(query)
-
-        print(f"   -> 联网获取了 {len(web_nodes)} 条信息")
-        # 覆盖掉之前的本地结果，因为本地的反正也没用
-        return {"retrieved_nodes": web_nodes, "source": "web"}
+        print("🌍 [Agent] 启动 Web Search...")
+        nodes = await tavily_search(state["original_question"])
+        return {"retrieved_nodes": nodes, "source": "web"}
     
-    async def grade_web_node(state: AgentState):
-        print("⚖️ [Agent] 正在审核网络搜索结果...")
-
-        query = state["original_question"]
-        nodes = state["retrieved_nodes"]
-
-        if not nodes:
-            print("   -> 网络搜索为空")
-            return {"grade_status": "no"}
-        
-        context_preview = "\n".join([n.get_content()[:300] for n in nodes[:3]])
-        prompt = get_grader_prompt(query, context_preview)
-
-        response = await llm.acomplete(prompt)
-        status = "yes" if "yes" in response.text.strip().lower() else "no"
-        print(f"-> 网络评分结果: {status}")
-        return {"grade_status": status}
-    
+    # --- Node 5: Generate (With Citations) ---
     async def generate_node(state: AgentState):
-        print("✍️ [Agent] 正在组织语言生成回答 (含引用)...")
-        source_type = state.get("source", "local")
+        print("✍️ [Agent] Generating...")
         nodes = state["retrieved_nodes"]
+        source_type = state.get("source", "local")
         
-        # 1. 精细化构建 Context (核心修改点) 🆕
-        context_list = []
-        for n in nodes:
-            # 尝试获取页码 (LlamaParse 通常存为 'page_label')
-            # 如果是 Web 搜索结果，metadata 可能为空，我们做个兼容
-            meta = n.metadata or {}
-            page = meta.get("page_label", "未知页")
-            file_name = meta.get("file_name", "教材")
+        # [Fix 2 & 3] Context Injection Logic
+        context_lines = []
+        for i, n in enumerate(nodes):
+            # Safe Metadata Access
+            meta = n.node.metadata or {}
+            file = meta.get("file_name", "教材")
+            page = meta.get("page", "?")
             
-            # 根据来源类型，生成不同的引用标签
+            # Construct Citation Tag
             if source_type == "web":
-                # Web 结果通常在 TextNode 里已经包含 URL，这里可以简化
-                source_tag = "[Web]" 
+                citation = "[Web]"
             else:
-                # 本地结果：[教材名称 P12]
-                source_tag = f"[{file_name} P{page}]"
+                citation = f"[{file} P{page}]"
             
-            # 拼接到文本前，让 LLM 知道这段话的出处
-            text = n.get_content()
-            context_list.append(f"---来源 {source_tag}---\n{text}")
+            # Inject into text so LLM sees it
+            text = n.node.get_content()
+            context_lines.append(f"引用来源 {citation}:\n{text}\n")
 
-        context_str = "\n\n".join(context_list)
+        context_str = "\n".join(context_lines)
         
-        # 2. 构造带“强制引用指令”的 Prompt 🆕
         system_prompt = (
-            f"你是一个严谨的计算机课程助教。请基于{source_type}资料回答问题。\n"
-            "【严格引用要求】：\n"
-            "1. 你的回答必须建立在参考资料的基础上，不要编造，不能自己编写，只能从给出的文本中总结回答。\n"
-            "2. **关键步骤**：在引用某个知识点时，请在句尾标注其来源页码，格式严格为 [教材 Pxx] 或 [Web]。\n"
-            "   - 错误示例：...死锁的定义(P12)。\n"
-            "   - 正确示例：...死锁是指两个进程互相等待 [计算机组成原理.pdf P12]。\n"
-            "3. 如果不同段落来自不同页码，请分别标注。\n"
+            f"你是一个专业的计算机助教。基于提供的{source_type}资料回答问题。\n"
+            f"【引用规范】：\n"
+            f"1. 凡是引用了资料里的观点或数据，必须在句尾加上来源标签，如 [计算机组成.pdf P12]。\n"
+            f"2. 来源标签我已经都在资料里给你写好了，直接抄下来。\n"
+            f"3. 如果资料里没有提及，不要编造。\n"
+            f"4. 保持回答简洁、逻辑清晰。"
         )
         
-        system_msg = ChatMessage(role="system", content=system_prompt)
-        # 使用原始问题 original_question 以保证准确性
-        user_msg = ChatMessage(role="user", content=f"参考资料：\n{context_str}\n\n用户问题：{state['original_question']}")
+        sys_msg = ChatMessage(role="system", content=system_prompt)
+        user_msg = ChatMessage(role="user", content=f"资料：\n{context_str}\n\n问题：{state['original_question']}")
         
-        response_stream = await llm.astream_chat([system_msg] + state.get("chat_history", []) + [user_msg])
-        
+        # Return the stream iterator directly
+        response_stream = await llm.astream_chat([sys_msg, user_msg])
         return {"final_response": response_stream}
-    
-    # 当全网都搜不到时，体面地结束
+
+    # --- Node 6: Fallback ---
     async def apologize_node(state: AgentState):
-        print("🛑 [Agent] 彻底放弃，执行 Fallback...")
-        text = "非常抱歉，我在本地教材和互联网上都没有找到相关信息。这可能是一个非常生僻的知识点，建议您查阅更专业的学术文献。"
-        # 直接返回字符串，main.py 也能处理
-        return {"final_response": text}
-    
+        return {"final_response": "抱歉，我在本地教材和网络上都未找到相关信息。"}
+
+    # --- Build Graph ---
     workflow = StateGraph(AgentState)
 
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("grade", grade_node)
     workflow.add_node("rewrite", rewrite_node)
     workflow.add_node("web_search", web_search_node)
-    workflow.add_node("grade_web", grade_web_node)
     workflow.add_node("generate", generate_node)
     workflow.add_node("apologize", apologize_node)
 
     workflow.set_entry_point("retrieve")
-
     workflow.add_edge("retrieve", "grade")
     workflow.add_edge("rewrite", "retrieve")
-    workflow.add_edge("web_search", "grade_web")
 
-    # 条件边 1: 本地评分后
+    # Conditional Logic
     def decide_local(state):
         if state["grade_status"] == "yes":
             return "generate"
-        elif state.get("retry_count", 0) < 1:
+        elif state["retry_count"] < 1: # Retry once
             return "rewrite"
         else:
             return "web_search"
-    
+
     workflow.add_conditional_edges(
-        "grade", decide_local,
+        "grade", 
+        decide_local,
         {
             "generate": "generate",
             "rewrite": "rewrite",
-            "web_search": "web_search",
+            "web_search": "web_search"
         }
     )
-
-    # 🆕 条件边 2: 网络评分后
-    def decide_web(state):
-        if state["grade_status"] == "yes":
-            return "generate" # 网络结果靠谱，去生成
-        else:
-            return "apologize" # 网络结果也是垃圾，去道歉
     
-    workflow.add_conditional_edges(
-        "grade_web", decide_web,
-        {
-            "generate": "generate",
-            "apologize": "apologize",
-        }
-    )
-
-    workflow.add_edge("apologize", END)
+    workflow.add_edge("web_search", "generate") # Simplify: Trust web search for now
     workflow.add_edge("generate", END)
+    workflow.add_edge("apologize", END)
 
-    app = workflow.compile()
-    return app
+    return workflow.compile()
