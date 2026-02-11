@@ -58,9 +58,9 @@ class LocalPDFParser:
                  alias_map_file="../data/global_alias_map.json",
                  use_vlm=True, 
                  max_concurrency=5,
-                 min_image_bytes=6144,
+                 min_image_bytes=3072,
                  max_edge_size=1600,
-                 min_edge_size=220,
+                 min_edge_size=100,
                  jpeg_quality=85):
         
         self.pdf_path = Path(pdf_path)
@@ -596,7 +596,22 @@ class LocalPDFParser:
                         continue
 
                     aspect_ratio = w / h
-                    if aspect_ratio > 8 or aspect_ratio < 0.15: continue
+                    if aspect_ratio > 10 or aspect_ratio < 0.1: continue
+
+                    try:
+                        with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                            gray_img = pil_img.convert("L")
+                            extrema = gray_img.getextrema()
+                            
+                            # [Fix] 显式类型检查：确保它是一个包含两个数字的元组
+                            if isinstance(extrema, tuple) and len(extrema) == 2:
+                                mn, mx = extrema
+                                # 再次确认内容是数字（解决 Pylance 认为可能是 tuple 的问题）
+                                if isinstance(mn, (int, float)) and isinstance(mx, (int, float)):
+                                    if mx - mn < 10:
+                                        continue
+                    except Exception:
+                        pass 
 
                     img_hash = self._compute_semantic_hash(img_bytes)
                     img_ext = base_image["ext"]

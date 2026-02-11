@@ -1,21 +1,18 @@
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
 import hashlib
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 
-# LlamaIndex Core
 from llama_index.core import Settings, VectorStoreIndex, PropertyGraphIndex
 from llama_index.core.retrievers import BaseRetriever, VectorContextRetriever
 from llama_index.core.llms import ChatMessage
 from llama_index.core.schema import NodeWithScore
 
-# Integrations
 from llama_index.llms.dashscope import DashScope
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -23,296 +20,192 @@ from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 import qdrant_client
 from neo4j import GraphDatabase
 
-# Import your Agent Workflow
 from .agent_workflow import create_graph_app
 
-# 1. Environment Setup
 load_dotenv()
 
-# Configuration
 QDRANT_URL = "http://localhost:6333"
-QDRANT_COLLECTION = "edu_matrix_chunks" # Ensure this matches ingestion
+QDRANT_COLLECTION = "edu_matrix_chunks"
 NEO4J_URL = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
-# Global Engine Container
 rag_engine = {}
 
-# ==========================================
-# 🔧 Robust Hybrid Retriever
-# ==========================================
+# [优化 2] 排序增强的 Hybrid Retriever
 class HybridRetriever(BaseRetriever):
-    """
-    Hybrid Retriever with Content-Based Deduplication.
-    Combines Vector Search (Dense) + Graph Search (Relationship-based).
-    """
     def __init__(self, vector_retriever, graph_retriever):
-        self.vector_retriever = vector_retriever
-        self.graph_retriever = graph_retriever
+        self.vector = vector_retriever
+        self.graph = graph_retriever
         super().__init__()
     
     def _retrieve(self, query_bundle) -> list[NodeWithScore]:
-        # 1. Parallel Retrieval
-        nodes_vect = self.vector_retriever.retrieve(query_bundle)
-        nodes_graph = self.graph_retriever.retrieve(query_bundle)
+        vec_nodes = self.vector.retrieve(query_bundle)
+        graph_nodes = self.graph.retrieve(query_bundle)
         
-        # 2. Robust Deduplication (Content Hash)
-        # Why? node_id can be unstable across different retrievers.
-        # Content hash ensures we don't show the same text twice.
         combined = []
         seen_hashes = set()
         
-        # Merge lists (Vector first usually gives better semantic matches)
-        for n in (nodes_vect + nodes_graph):
-            # Safe access to node content
+        # 合并策略：优先向量（通常分高），再补图谱
+        for n in (vec_nodes + graph_nodes):
             content = n.node.get_content()
             if not content: continue
+            norm_text = content[:200].strip().lower()
+            h = hashlib.md5(norm_text.encode('utf-8')).hexdigest()
             
-            # Create a hash of the first 200 chars (sufficient for uniqueness)
-            content_hash = hashlib.md5(content[:200].encode('utf-8')).hexdigest()
-            
-            if content_hash not in seen_hashes:
+            if h not in seen_hashes:
                 combined.append(n)
-                seen_hashes.add(content_hash)
-                
+                seen_hashes.add(h)
+        
+        # [关键] 按分数降序排列，确保高质量内容在前
+        combined.sort(key=lambda x: x.score or 0.0, reverse=True)
         return combined
-
-# ==========================================
-# 🚀 Lifecycle Management
-# ==========================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 [Startup] Initializing EduMatrix Engine...")
-    
+    print("🚀 [Startup] Initializing Engine...")
     try:
-        # 1. Initialize Models
-        print("🧠 Loading Models (BGE-M3 + Qwen)...")
-        # [Optimization] Use 'cuda' if available, else 'cpu'
-        embed_model = HuggingFaceEmbedding(
-            model_name="BAAI/bge-m3",
-            trust_remote_code=True,
-            # local_files_only=True, # Uncomment if models are pre-downloaded
-            device="cpu", # Change to "cuda" for GPU
-        )
+        # Models
+        embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-m3", trust_remote_code=True, device="cpu")
         Settings.embed_model = embed_model
-
-        llm = DashScope(
-            model_name=os.getenv("DASHSCOPE_MODEL_NAME", "qwen-plus"),
-            api_key=os.getenv("DASHSCOPE_API_KEY"),
-            temperature=0.1,
-        )
+        llm = DashScope(model_name="qwen-plus", api_key=os.getenv("DASHSCOPE_API_KEY"))
         rag_engine["llm"] = llm
 
-        # 2. Connect Qdrant (Chunks)
-        print(f"🔌 Connecting Qdrant ({QDRANT_COLLECTION})...")
-        qdrant_client_obj = qdrant_client.QdrantClient(url=QDRANT_URL)
-        vector_store = QdrantVectorStore(
-            collection_name=QDRANT_COLLECTION,
-            client=qdrant_client_obj,
-        )
-        vector_index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
-
-        # 3. Connect Neo4j (Graph)
-        print("🔌 Connecting Neo4j...")
-        graph_store = Neo4jPropertyGraphStore(
-            username=NEO4J_USER,
-            password=NEO4J_PASSWORD,
-            url=NEO4J_URL,
-        )
-        # Note: We use from_existing because ingestion is done separately
-        graph_index = PropertyGraphIndex.from_existing(
-            property_graph_store=graph_store,
-            llm=llm,
-            embed_model=embed_model # Ensure consistency
-        )
-
-        rag_engine["graph_store"] = graph_store
-
-        # 4. Build Retrievers
-        # A. Vector Retriever (Dense)
-        vector_tool = vector_index.as_retriever(similarity_top_k=8)
+        # Stores
+        q_client = qdrant_client.QdrantClient(url=QDRANT_URL)
+        v_store = QdrantVectorStore(client=q_client, collection_name=QDRANT_COLLECTION)
+        v_index = VectorStoreIndex.from_vector_store(vector_store=v_store)
         
-        # B. Graph Retriever (Contextual)
-        # [Fix] Explicitly pass embed_model to avoid default fallback issues
-        sub_retriever = VectorContextRetriever(
-            graph_store=graph_store,
-            embed_model=embed_model, 
-            similarity_top_k=8,
-            path_depth=2 # Fetch 2-hop neighbors (CPU -> ALU -> ControlUnit)
-        )
-        graph_tool = graph_index.as_retriever(
-            sub_retrievers=[sub_retriever]
-        )
+        g_store = Neo4jPropertyGraphStore(username=NEO4J_USER, password=NEO4J_PASSWORD, url=NEO4J_URL)
+        g_index = PropertyGraphIndex.from_existing(property_graph_store=g_store, llm=llm, embed_model=embed_model)
 
-        # C. Hybrid Retriever
-        hybrid_retriever = HybridRetriever(vector_tool, graph_tool)
+        # Retrievers
+        v_tool = v_index.as_retriever(similarity_top_k=8)
+        sub_retriever = VectorContextRetriever(graph_store=g_store, embed_model=embed_model, similarity_top_k=8, path_depth=2)
+        g_tool = g_index.as_retriever(sub_retrievers=[sub_retriever])
+        
+        hybrid_retriever = HybridRetriever(v_tool, g_tool)
 
-        # 5. Build LangGraph Agent
-        print("🤖 Building LangGraph Workflow...")
-        graph_app = create_graph_app(hybrid_retriever, llm)
-
-        rag_engine["graph_app"] = graph_app
-        print("✅ Engine Initialized Successfully!")
-
+        # Workflow
+        workflow = create_graph_app(hybrid_retriever, llm)
+        rag_engine["graph_app"] = workflow
+        
+        rag_engine["neo4j_driver"] = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        print("✅ Engine Ready!")
     except Exception as e:
-        print(f"❌ Startup Failed: {traceback.format_exc()}")
-        # We don't raise here to allow the server to start (and return 500s), 
-        # but in production, you might want to raise.
-        
-    yield 
-    print("👋 [Shutdown] EduMatrix Engine stopped.")
+        print(f"❌ Startup Error: {e}")
+        traceback.print_exc()
 
-# ==========================================
-# 📡 API Endpoints
-# ==========================================
+    yield
+
+    print("👋 [Shutdown] Cleaning up...")
+    if "graph_app" in rag_engine:
+        await rag_engine["graph_app"].aclose()
+    if "neo4j_driver" in rag_engine:
+        rag_engine["neo4j_driver"].close()
 
 app = FastAPI(title="EduMatrix API", lifespan=lifespan)
 
-class Message(BaseModel):
-    role: str
-    content: str
+# Static Files
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+if not DATA_DIR.exists(): os.makedirs(DATA_DIR, exist_ok=True)
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory=DATA_DIR), name="static")
 
 class ChatRequest(BaseModel):
-    messages: list[Message]
+    messages: list[dict]
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
-    if not rag_engine.get("graph_app"):
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    if not request.messages:
-        raise HTTPException(status_code=400, detail="Messages cannot be empty")
-    
-    # 1. Parse Input
-    last_message = request.messages[-1].content
-    print(f"📩 Query: {last_message}")
+    if "graph_app" not in rag_engine:
+        raise HTTPException(status_code=503, detail="Service not ready")
 
-    # 2. Prepare History
-    chat_history = [
-        ChatMessage(role=m.role, content=m.content)
-        for m in request.messages[:-1]
-    ]
+    last_msg = request.messages[-1]["content"]
+    history = [ChatMessage(role=m["role"], content=m["content"]) for m in request.messages[:-1]]
 
-    inputs = {
-        "question": last_message,
-        "original_question": last_message,
-        "chat_history": chat_history,
-        "retrieved_nodes": [],
-        "grade_status": "",
-        "retry_count": 0,
-        "final_response": ""
-    }
-
-    # 3. Execute Graph
     try:
-        result = await rag_engine["graph_app"].ainvoke(inputs)
+        result = await rag_engine["graph_app"].run(question=last_msg, chat_history=history)
         streaming_response = result["final_response"]
+        retrieved_nodes = result["retrieved_nodes"]
     except Exception as e:
-        print(f"❌ Graph Execution Error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 4. Stream Response
     async def response_generator():
-        # A. AI Content
-        if isinstance(streaming_response, str):
-            yield streaming_response
-        elif hasattr(streaming_response, "async_response_gen"):
-            async for token in streaming_response.async_response_gen():
-                yield token.delta
-        else:
-            # [Fix] Safer iteration for unknown stream types
-            try:
-                async for token in streaming_response:
-                    # Robust attribute access
-                    text = getattr(token, "delta", None) or getattr(token, "text", "")
-                    yield text
-            except Exception as e:
-                yield f" [Error reading stream: {e}]"
+        iterator = streaming_response
+        if hasattr(streaming_response, "async_response_gen"):
+            iterator = streaming_response.async_response_gen()
+        
+        async for token in iterator:
+            text = getattr(token, "delta", None) or getattr(token, "text", None) or str(token)
+            yield text
 
-        # B. Citations / Sources
-        nodes = result.get("retrieved_nodes", [])
-        if nodes:
+        if retrieved_nodes:
             yield "\n\n---\n**🧠 Thinking Process:**\n"
-            yield f"- Retrieved {len(nodes)} fragments (Vector + Graph)\n"
-            yield "\n**📚 Sources:**\n"
-            
             seen_texts = set()
-            for n in nodes:
-                # [Fix] Access metadata via n.node.metadata
-                meta = n.node.metadata or {}
-                page = meta.get("page", "?")
-                # Fallback to 50 chars preview if file_name missing
-                source_name = meta.get("file_name", "Textbook")
-                
-                # Robust content access
-                content_preview = n.node.get_content()[:50].replace('\n', ' ')
-                
-                if content_preview not in seen_texts:
-                    yield f"> **[{source_name} P{page}]**: {content_preview}...\n"
-                    seen_texts.add(content_preview)
+            seen_images = set()
             
+            for n in retrieved_nodes:
+                # 兼容 Dict
+                if isinstance(n, dict):
+                    meta = n.get("metadata", {})
+                    content = n.get("text", "")
+                else:
+                    meta = n.node.metadata
+                    content = n.node.get_content()
+
+                preview = content[:50].replace('\n', ' ')
+                if preview not in seen_texts:
+                    yield f"> **[{meta.get('file_name','Doc')} P{meta.get('page','?')}]**: {preview}...\n"
+                    seen_texts.add(preview)
+
+                fname = meta.get("file_name", "")
+                if fname not in ["Web", "Textbook"]:
+                    try:
+                        safe_name = Path(fname).stem.replace(" ", "_")
+                        page = meta.get("page", "?")
+                        img_dir = DATA_DIR / "parser_cache" / safe_name / "images"
+                        if img_dir.exists():
+                            prefix = f"p{page}_"
+                            for f in os.listdir(img_dir):
+                                if f.startswith(prefix) and f.lower().endswith(('.jpg', '.png')):
+                                    img_url = f"{API_BASE_URL}/static/parser_cache/{safe_name}/images/{f}"
+                                    if img_url not in seen_images:
+                                        yield f"\n![Page {page}]({img_url})\n"
+                                        seen_images.add(img_url)
+                    except Exception:
+                        pass
+
     return StreamingResponse(response_generator(), media_type="text/plain")
 
 @app.post("/api/graph")
 async def get_graph(request: ChatRequest):
-    """
-    Fetch subgraph for visualization based on user query.
-    """
     result_data = {"links": []}
+    if not request.messages: return result_data
     
+    query = request.messages[-1]["content"]
     try:
-        if not request.messages:
-            return result_data
-            
-        user_query = request.messages[-1].content
-        print(f"🕸️ [Graph API] Query: {user_query}")
+        prompt = f"Extract 1-3 technical entities from '{query}', comma separated."
+        res = await rag_engine["llm"].acomplete(prompt)
+        keywords = [k.strip() for k in res.text.split(',') if k.strip()] or [query]
 
-        # 1. Extract Keywords (Simple LLM Call)
-        # Using a direct prompt to get cleaner keywords
-        prompt = (
-            f"Extract 1-3 core technical entities from this query: '{user_query}'. "
-            "Output ONLY the keywords separated by commas. No other text."
-        )
-        response = await rag_engine["llm"].acomplete(prompt)
-        keywords = [k.strip() for k in response.text.split(',') if k.strip()]
-        
-        if not keywords: 
-            keywords = [user_query]
-        
-        print(f"   Keywords: {keywords}")
-
-        # 2. Cypher Query
-        # [Fix] Use 'name' instead of 'id' because ingestion uses 'name'.
-        # [Fix] Use 'CONTAINS' and 'toLower' for fuzzy matching.
-        cypher_sql = """
+        cypher = """
         MATCH (n)-[r]->(m)
-        WHERE (
-            ANY(k IN $keywords WHERE toLower(n.name) CONTAINS toLower(k)) 
-            OR 
-            ANY(k IN $keywords WHERE toLower(m.name) CONTAINS toLower(k))
-        )
-        RETURN n.name AS source, type(r) AS label, m.name AS target
-        LIMIT 30
+        WHERE (ANY(k IN $kw WHERE toLower(n.name) CONTAINS toLower(k)) 
+            OR ANY(k IN $kw WHERE toLower(m.name) CONTAINS toLower(k)))
+        RETURN n.name as source, type(r) as label, m.name as target LIMIT 30
         """
         
-        # 3. Execute
-        driver = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        with driver.session() as session:
-            result = session.run(cypher_sql, keywords=keywords)
-            records = [record.data() for record in result]
-            result_data["links"] = records
-            print(f"   Found {len(records)} relations.")
-            
-        driver.close()
-
+        driver = rag_engine.get("neo4j_driver")
+        if driver:
+            with driver.session() as session:
+                res = session.run(cypher, kw=keywords)
+                result_data["links"] = [r.data() for r in res]
+                
     except Exception as e:
-        traceback.print_exc()
-        print(f"❌ Graph API Error: {e}")
-
+        print(f"Graph Error: {e}")
+        
     return result_data
-
-@app.get("/")
-def read_root():
-    return {"status": "active", "model": "EduMatrix V2"}

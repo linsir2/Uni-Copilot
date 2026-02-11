@@ -282,7 +282,7 @@ async def main(pdf_path_str: str, force_recreate: bool = True):
         max_concurrency=5
     )
     documents = await parser.parse()
-    documents = documents[10:15]
+    # documents = documents[10:15]
     print(f"✅ Parsing complete. Acquired {len(documents)} page-level documents.")
 
     # 3. Init Embeddings & LLM
@@ -379,7 +379,7 @@ async def main(pdf_path_str: str, force_recreate: bool = True):
         property_graph_store=graph_store,
         vector_store=vector_store_entities,
         # Ensure we don't re-embed what Upsert already handled
-        embed_kg_nodes=False, 
+        embed_kg_nodes=True, 
         show_progress=True,
     )
 
