@@ -17,6 +17,13 @@ from core.edu_parser.base import MultimodalAgenticRAGPack
 
 load_dotenv()
 
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+if not DATA_DIR.exists(): 
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+print(f"📂 [Config] DATA_DIR set to: {DATA_DIR}")
+
 # Configuration
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 NEO4J_URL = "bolt://localhost:7687"
@@ -41,7 +48,7 @@ async def lifespan(app: FastAPI):
             neo4j_password=NEO4J_PASSWORD,
             dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
             tavily_api_key=os.getenv("TAVILY_API_KEY"), # Optional: enables web search
-            data_dir="./data"
+            data_dir=str(DATA_DIR),
         )
         
         # 2. Independent driver for the /api/graph visualization endpoint
@@ -61,9 +68,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="EduMatrix API", lifespan=lifespan)
 
 # Static Files Setup
-BASE_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = BASE_DIR / "data"
-if not DATA_DIR.exists(): os.makedirs(DATA_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=DATA_DIR), name="static")
 
 class ChatRequest(BaseModel):
@@ -128,14 +132,11 @@ async def chat_endpoint(request: ChatRequest):
         iterator = streaming_response
         if hasattr(streaming_response, "async_response_gen"):
             iterator = streaming_response.async_response_gen()
-        
-        full_text = ""
 
         async for token in iterator:
             text = getattr(token, "delta", None) or getattr(token, "text", None)
             if text:
                 yield text
-                full_text += text
 
         # 2. Append Citations & Images (Frontend logic)
         if retrieved_nodes:
@@ -162,16 +163,23 @@ async def chat_endpoint(request: ChatRequest):
                         
                         # Check local storage for images associated with this page
                         img_dir = DATA_DIR / "parser_cache" / safe_name / "images"
+                        prefix = f"p{page_idx}_"
+
+                        print(f"🔍 [ImgDebug] 寻找图片: {prefix} in {img_dir}")
                         if img_dir.exists():
-                            prefix = f"p{page_idx}_"
                             for f in os.listdir(img_dir):
-                                if f.startswith(prefix) and f.lower().endswith(('.jpg', '.png')):
+                                if f.startswith(prefix) and f.lower().endswith(('.jpg', '.png', '.jpeg')):
                                     img_url = f"{API_BASE_URL}/static/parser_cache/{safe_name}/images/{f}"
                                     if img_url not in seen_images:
+                                        print(f"✅ [ImgDebug] 找到图片: {img_url}")
                                         yield f"\n![Page {page_idx}]({img_url})\n"
                                         seen_images.add(img_url)
-                    except Exception:
-                        pass
+                        else:
+                             print(f"❌ [ImgDebug] 目录不存在: {img_dir}")
+
+                    except Exception as e:
+                        print(f"⚠️ Image Error: {e}")
+                        traceback.print_exc()
 
     return StreamingResponse(response_generator(), media_type="text/plain")
 
