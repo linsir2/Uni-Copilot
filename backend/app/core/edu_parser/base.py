@@ -37,8 +37,7 @@ from llama_index.core.llms import LLM
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.llms.dashscope import DashScope
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-
+from llama_index.embeddings.fastembed import FastEmbedEmbedding
 # Qdrant & Neo4j Drivers
 import qdrant_client
 from qdrant_client.http import models as rest
@@ -237,7 +236,7 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
             self.llm = llm
         elif dashscope_api_key:
             self.llm = DashScope(
-                model_name="qwen-plus", api_key=dashscope_api_key, temperature=0.1
+                model_name="qwen-plus-latest", api_key=dashscope_api_key, temperature=0.1
             )
         else:
             raise ValueError(
@@ -247,9 +246,11 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         if embed_model is not None:
             self.embed_model = embed_model
         else:
-            print("ℹ️ No embed_model provided, falling back to BAAI/bge-m3...")
-            self.embed_model = HuggingFaceEmbedding(
-                model_name="BAAI/bge-m3", trust_remote_code=True
+            print("ℹ️ No embed_model provided, falling back to default embed_model")
+            self.embed_model = FastEmbedEmbedding(
+                model_name="BAAI/bge-small-zh-v1.5",
+                threads=None,
+                cache_dir="./local_cache",
             )
 
         Settings.llm = self.llm
@@ -325,6 +326,13 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
                     session.run(
                         "CREATE INDEX entity_name_index IF NOT EXISTS FOR (n:Entity) ON (n.name)"
                     )
+                    session.run(
+                    """
+                    CREATE CONSTRAINT entity_norm_name IF NOT EXISTS
+                    FOR (e:Entity)
+                    REQUIRE e.normalized_name IS UNIQUE
+                    """
+                    )
         except Exception:
             pass
 
@@ -343,8 +351,12 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         cache_dir.mkdir(parents=True, exist_ok=True)
         sidecar_file = cache_dir / "page_heavy_data.json"
 
-        self._check_and_create_collection(self.collections["chunks"], is_entity=False)
-        self._check_and_create_collection(self.collections["entities"], is_entity=True)
+        test_embed = await self.embed_model.aget_text_embedding("hello")
+        current_dim = len(test_embed)
+        print(f"📏 Detected Embedding Dimension: {current_dim}")
+
+        self._check_and_create_collection(self.collections["chunks"], vector_size=current_dim, is_entity=False)
+        self._check_and_create_collection(self.collections["entities"], vector_size=current_dim, is_entity=True)
         self._clear_neo4j()
 
         # 1. Parse PDF
@@ -485,7 +497,6 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         )
 
         print("🎉 Ingestion Pipeline Completed!")
-        self._refresh_retriever()
 
     def _refresh_retriever(self):
         """Re-initializes the Hybrid Retriever (Vector + Graph)"""

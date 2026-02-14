@@ -30,25 +30,37 @@ def upload_file(files):
         return "⚠️ 请先选择文件"
     
     # Gradio 的 file 可能是列表
-    file_obj = files[0] if isinstance(files, list) else files
+    files = files if isinstance(files, list) else [files]
     
-    try:
-        print(f"📤 [前端] 正在上传: {file_obj.name}")
-        
-        # 构造 multipart/form-data 请求
-        with open(file_obj.name, "rb") as f:
-            files_payload = {"file": (os.path.basename(file_obj.name), f, "application/pdf")}
-            response = requests.post(API_UPLOAD_URL, files=files_payload, timeout=300)
-        
-        if response.status_code == 200:
-            res_json = response.json()
-            return f"✅ 上传成功！\n{res_json.get('message', '后台正在处理...')}"
-        else:
-            return f"❌ 上传失败 (Code {response.status_code}):\n{response.text}"
-            
-    except Exception as e:
-        return f"❌ 连接错误: {str(e)}"
+    results = []
 
+    for file_obj in files:
+        try:
+            print(f"📤 [前端] 正在上传: {file_obj.name}")
+        
+            # 构造 multipart/form-data 请求
+            with open(file_obj.name, "rb") as f:
+                files_payload = {"file": (os.path.basename(file_obj.name), f, "application/pdf")}
+                response = requests.post(API_UPLOAD_URL, files=files_payload, timeout=300)
+        
+            if response.status_code == 200:
+                res_json = response.json()
+                results.append(
+                    f"✅ {os.path.basename(file_obj.name)} 上传成功\n"
+                    f"   ↳ task_id: {res_json.get('task_id', 'N/A')}"
+                )
+            else:
+                results.append(
+                    f"❌ {os.path.basename(file_obj.name)} 上传失败 "
+                    f"(Code {response.status_code})"
+                )
+            
+        except Exception as e:
+            results.append(
+                f"❌ {os.path.basename(file_obj.name)} 上传异常: {str(e)}"
+            )
+    
+    return "\n\n".join(results)
 # ================= 2. 图谱生成功能 =================
 def generate_graph_html(query):
     """
@@ -195,7 +207,7 @@ with gr.Blocks(title="EduMatrix Pro", css=custom_css) as demo:
             file_input = gr.File(
                 label="上传教科书 (PDF)", 
                 file_types=[".pdf"],
-                file_count="single"
+                file_count="multiple"
             )
             upload_btn = gr.Button("🚀 开始上传与摄取", variant="primary")
             upload_status = gr.Textbox(label="系统状态", interactive=False, lines=4)

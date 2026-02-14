@@ -1,6 +1,4 @@
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
 import traceback
 import shutil
 from contextlib import asynccontextmanager
@@ -12,8 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 
-# Import the Encapsulated Pack
 from core.edu_parser.base import MultimodalAgenticRAGPack
+from worker import parse_pdf
 
 load_dotenv()
 
@@ -30,16 +28,15 @@ NEO4J_URL = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-# Global State
 rag_pack: MultimodalAgenticRAGPack
 neo4j_driver = None  # Kept separate for the raw graph visualization endpoint
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 [Startup] Initializing Agentic RAG Pack...")
-    global rag_pack, neo4j_driver
+    print("🚀 [Startup] Initializing Retrieval RAG Pack...")
+    global neo4j_driver, rag_pack
+
     try:
-        # 1. Initialize the Pack (Handles LLM, Embeddings, Qdrant, Neo4j, Workflow internally)
         rag_pack = MultimodalAgenticRAGPack(
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY"),
@@ -47,21 +44,22 @@ async def lifespan(app: FastAPI):
             neo4j_username=NEO4J_USER,
             neo4j_password=NEO4J_PASSWORD,
             dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
-            tavily_api_key=os.getenv("TAVILY_API_KEY"), # Optional: enables web search
+            tavily_api_key=os.getenv("TAVILY_API_KEY"),
             data_dir=str(DATA_DIR),
         )
-        
-        # 2. Independent driver for the /api/graph visualization endpoint
-        neo4j_driver = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        
-        print("✅ Engine Ready!")
+
+        neo4j_driver = GraphDatabase.driver(
+            NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASSWORD)
+        )
+
+        print("✅ Retrieval Engine Ready!")
+
     except Exception as e:
         print(f"❌ Startup Error: {e}")
         traceback.print_exc()
 
     yield
 
-    print("👋 [Shutdown] Cleaning up...")
     if neo4j_driver:
         neo4j_driver.close()
 
@@ -76,11 +74,8 @@ class ChatRequest(BaseModel):
 @app.post("/api/upload")
 async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
-    上传 PDF 并触发后台摄取任务 (Ingestion)
+    上传 PDF -> Celery Ingestion
     """
-    if not rag_pack:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
     # 1. 确保数据目录存在
     upload_dir = DATA_DIR / "uploads"
     if not upload_dir.exists():
@@ -94,28 +89,17 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File save failed: {e}")
 
-    # 3. 触发摄取 (建议使用 BackgroundTasks 防止请求超时)
-    #    注意：run_ingestion 会执行 OCR、VLM 图片分析、存入 Qdrant 和 Neo4j
-    background_tasks.add_task(handle_ingestion, str(file_path))
+    # 3. 发送给Celery
+    task = parse_pdf.delay(str(file_path))
 
-    return {"status": "processing", "message": f"Ingestion started for {file.filename}. This may take a while."}
-
-async def handle_ingestion(file_path: str):
-    """后台处理逻辑"""
-    print(f"📥 Starting ingestion for: {file_path}")
-    try:
-        # 调用 base.py 中定义的 run_ingestion
-        await rag_pack.run_ingestion(file_path)
-        print(f"✅ Ingestion complete for: {file_path}")
-    except Exception as e:
-        print(f"❌ Ingestion failed: {e}")
-        traceback.print_exc()
+    return {
+        "status": "queued",
+        "task_id": task.id,
+        "message": f"{file.filename} 已加入解析队列"
+    }
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
-    if not rag_pack:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
     last_msg = request.messages[-1]["content"]
     
     # Run the Pack (it handles retrieval -> grading -> generation internally)
@@ -200,9 +184,24 @@ async def get_graph(request: ChatRequest):
 
         cypher = """
         MATCH (n)-[r]->(m)
-        WHERE (ANY(k IN $kw WHERE toLower(n.name) CONTAINS toLower(k)) 
-            OR ANY(k IN $kw WHERE toLower(m.name) CONTAINS toLower(k)))
-        RETURN n.name as source, type(r) as label, m.name as target LIMIT 30
+        WHERE ANY(k IN $kw WHERE toLower(COALESCE(n.name, n.text, '')) CONTAINS toLower(k))
+           OR ANY(k IN $kw WHERE toLower(COALESCE(m.name, m.text, '')) CONTAINS toLower(k))
+
+        RETURN 
+            COALESCE(
+                n.name, 
+                CASE WHEN n.file_name IS NOT NULL THEN n.file_name + ' (P' + toString(n.page_label) + ')' END, 
+                'Unknown Node'
+            ) AS source,
+    
+            type(r) AS label,
+    
+            COALESCE(
+                m.name, 
+                CASE WHEN m.file_name IS NOT NULL THEN m.file_name + ' (P' + toString(m.page_label) + ')' END, 
+                'Unknown Node'
+            ) AS target
+        LIMIT 30
         """
         
         if neo4j_driver:

@@ -3,6 +3,7 @@ aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
 aiosqlite==0.22.1
+amqp==5.3.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1
@@ -10,11 +11,16 @@ asttokens==3.0.1
 async-timeout==5.0.1
 attrs==25.4.0
 banks==2.4.0
+billiard==4.2.4
 brotli==1.2.0
+celery==5.6.2
 certifi==2026.1.4
 cffi==2.0.0
 charset-normalizer==3.4.4
 click==8.3.1
+click-didyoumean==0.3.1
+click-plugins==1.1.1.2
+click-repl==0.3.0
 colorama==0.4.6
 cryptography==46.0.5
 cuda-bindings==12.9.4
@@ -54,13 +60,14 @@ jedi==0.19.2
 Jinja2==3.1.6
 joblib==1.5.3
 jsonpickle==4.1.1
+kombu==5.6.2
 llama-index-core==0.14.14
 llama-index-embeddings-huggingface==0.6.1
 llama-index-graph-stores-neo4j==0.5.1
 llama-index-instrumentation==0.4.2
 llama-index-llms-dashscope==0.5.2
 llama-index-multi-modal-llms-dashscope==0.4.1
--e git+https://github.com/linsir2/Uni-Copilot.git@fd8c7dac9e461352326d453f16919eaace514aae#egg=llama_index_packs_multimodal_agentic_rag
+-e git+https://github.com/linsir2/Uni-Copilot.git@7f8910b5dae81ffb5de94128bdf3e083ac5d22dd#egg=llama_index_packs_multimodal_agentic_rag
 llama-index-vector-stores-qdrant==0.9.1
 llama-index-workflows==2.14.1
 markdown-it-py==4.0.0
@@ -120,6 +127,7 @@ pytz==2025.2
 pyvis==0.3.2
 PyYAML==6.0.3
 qdrant-client==1.16.2
+redis==7.1.1
 regex==2026.1.15
 requests==2.32.5
 rich==14.3.2
@@ -151,8 +159,10 @@ typing-inspect==0.9.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2025.3
+tzlocal==5.3.1
 urllib3==2.6.3
 uvicorn==0.40.0
+vine==5.1.0
 wcwidth==0.6.0
 websocket-client==1.9.0
 wrapt==2.1.1

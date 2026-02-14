@@ -10,7 +10,7 @@ services:
       - NEO4J_AUTH=neo4j/password123
       - NEO4J_PLUGINS=["apoc"] # 开启APOC插件
     volumes:
-      - ./data/neo4j:/data
+      - ./dbs/neo4j:/data
 
   # 2. Qdrant: 向量数据库
   qdrant:
@@ -19,11 +19,33 @@ services:
     ports:
       - "6333:6333" # 向量检索接口：浏览器输入localhost:6333/dashboard
     volumes:
-      - ./data/qdrant:/qdrant/storage
+      - ./dbs/qdrant:/qdrant/storage
   
   # 3. Redis: 缓存
   redis:
-    image: redis:latest
+    image: redis/redis-stack:latest
     container_name: edu_redis
     ports:
-      - "6379:6379" # 终端输入：docker exec -it edu_redis redis-cli ping     验证redis是否开启
+      - "6379:6379" # 终端输入：docker exec -it edu_redis redis-cli ping 
+      - "8001:8001" 
+  
+  # web:
+  #   build:  .
+  #   command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - .:/app
+  #   depends_on:
+  #     - redis
+  
+  # worker:
+  #   build: .
+  #   command: celery -A backend.app.worker.celery_app worker --loglevel=info
+  #   volumes:
+  #     - .:/app
+  #   depends_on:
+  #     - redis
+  #   environment:
+  #     - CELERY_BROKER_URL=redis://redis:6379/0
+  #     - CELERY_RESULT_BACKEND=redis://redis:6379/0

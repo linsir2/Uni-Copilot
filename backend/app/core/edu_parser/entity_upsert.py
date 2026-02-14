@@ -230,12 +230,16 @@ def neo4j_merge_entities(
                     # Store normalized name for querying
                     safe_props["normalized_name"] = normalize_entity_name(raw_name)
 
-                    rows.append({"name": raw_name, "props": safe_props})
+                    rows.append({
+                        "normalized_name": normalize_entity_name(raw_name), 
+                        "name": raw_name,
+                        "props": {**safe_props, "name": raw_name}
+                    })
 
                 # Cypher UNWIND MERGE
                 query = """
                 UNWIND $rows AS row
-                MERGE (e:Entity {name: row.name})
+                MERGE (e:Entity {normalized_name: row.normalized_name})
                 SET e += row.props
                 RETURN count(e) as c
                 """

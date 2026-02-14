@@ -43,6 +43,9 @@ data/
 data_test/
 examples/data/
 examples/data_test/
+dbs/
+
+backend/app/local_cache/
 
 parsed_images/
 examples/parsed_images/
