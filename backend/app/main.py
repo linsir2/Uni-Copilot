@@ -1,6 +1,15 @@
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+import time
 import traceback
 import shutil
+import hashlib
+import json
+import gzip
+import dashscope
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as rest
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
@@ -9,6 +18,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from neo4j import GraphDatabase
+from redis import asyncio as aioredis
+from redis.asyncio import Redis
 
 from core.edu_parser.base import MultimodalAgenticRAGPack
 from worker import parse_pdf
@@ -24,17 +35,39 @@ print(f"📂 [Config] DATA_DIR set to: {DATA_DIR}")
 
 # Configuration
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 NEO4J_URL = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
 rag_pack: MultimodalAgenticRAGPack
+redis_client: Redis | None = None
 neo4j_driver = None  # Kept separate for the raw graph visualization endpoint
+qdrant_client = None
+
+SEMANTIC_COLLECTION = "graph_query_cache"
+
+async def get_query_embedding(text: str):
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        return None
+    
+    try:
+        resp = dashscope.TextEmbedding.call(
+            model=dashscope.TextEmbedding.Models.text_embedding_v2,
+            input=text,
+            api_key=api_key,
+        )
+        if resp.status_code == 200:
+            return resp.output["embeddings"][0]["embedding"]
+    except Exception as e:
+        print(f"⚠️ Embedding Error: {e}")
+    return []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 [Startup] Initializing Retrieval RAG Pack...")
-    global neo4j_driver, rag_pack
+    global redis_client, neo4j_driver, rag_pack, qdrant_client
 
     try:
         rag_pack = MultimodalAgenticRAGPack(
@@ -48,9 +81,24 @@ async def lifespan(app: FastAPI):
             data_dir=str(DATA_DIR),
         )
 
+        redis_client = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+
         neo4j_driver = GraphDatabase.driver(
             NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASSWORD)
         )
+
+        qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+        qdrant_client = QdrantClient(url=qdrant_url, api_key=os.getenv("QDRANT_API_KEY"), prefer_grpc=False)
+
+        if not qdrant_client.collection_exists(SEMANTIC_COLLECTION):
+            print(f"📦 Creating Semantic Cache Collection: {SEMANTIC_COLLECTION}")
+            qdrant_client.create_collection(
+                collection_name=SEMANTIC_COLLECTION,
+                vectors_config=rest.VectorParams(
+                    size=1536, # 🔥 注意：DashScope text-embedding-v2 是 1536 维
+                    distance=rest.Distance.COSINE
+                )
+            )
 
         print("✅ Retrieval Engine Ready!")
 
@@ -62,6 +110,10 @@ async def lifespan(app: FastAPI):
 
     if neo4j_driver:
         neo4j_driver.close()
+    if redis_client:
+        await redis_client.aclose()
+    if qdrant_client:
+        qdrant_client.close()
 
 app = FastAPI(title="EduMatrix API", lifespan=lifespan)
 
@@ -72,7 +124,7 @@ class ChatRequest(BaseModel):
     messages: list[dict]
 
 @app.post("/api/upload")
-async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...)):
     """
     上传 PDF -> Celery Ingestion
     """
@@ -81,6 +133,20 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
     if not upload_dir.exists():
         upload_dir.mkdir(parents=True, exist_ok=True)
 
+    file_content = await file.read()
+    file_hash = hashlib.md5(file_content).hexdigest()
+    await file.seek(0)
+
+    cache_key = f"pdf:task:{file_hash}"
+    if redis_client:
+        existing_task_id = await redis_client.get(cache_key)
+        if existing_task_id:
+            return {
+                "status": "cached",
+                "task_id": existing_task_id,
+                "message": f"⚡ 秒传成功！{file.filename} 之前已上传过。",
+            }
+        
     # 2. 保存文件到本地
     file_path = upload_dir / (file.filename or "")
     try:
@@ -92,6 +158,12 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
     # 3. 发送给Celery
     task = parse_pdf.delay(str(file_path))
 
+    if redis_client:
+        await redis_client.set(
+            cache_key,
+            task.id,
+            ex=24 * 3600,
+        )
     return {
         "status": "queued",
         "task_id": task.id,
@@ -112,58 +184,62 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     async def response_generator():
-        # 1. Stream the LLM response
-        iterator = streaming_response
-        if hasattr(streaming_response, "async_response_gen"):
-            iterator = streaming_response.async_response_gen()
+        try:
+            # 1. Stream the LLM response
+            iterator = streaming_response
+            if hasattr(streaming_response, "async_response_gen"):
+                iterator = streaming_response.async_response_gen()
 
-        async for token in iterator:
-            text = getattr(token, "delta", None) or getattr(token, "text", None)
-            if text:
-                yield text
+            async for token in iterator:
+                text = getattr(token, "delta", None) or getattr(token, "text", None)
+                if text:
+                    yield text
 
-        # 2. Append Citations & Images (Frontend logic)
-        if retrieved_nodes:
-            yield "\n\n---\n**🧠 Thinking Process:**\n"
-            seen_texts = set()
-            seen_images = set()
+            # 2. Append Citations & Images (Frontend logic)
+            if retrieved_nodes:
+                yield "\n\n---\n**🧠 Thinking Process:**\n"
+                seen_texts = set()
+                seen_images = set()
             
-            for n in retrieved_nodes:
-                meta = n.get("metadata", {})
-                content = n.get("text", "")
-                
-                # Text Citation
-                preview = content[:50].replace('\n', ' ')
-                if preview not in seen_texts:
-                    yield f"> **[{meta.get('file_name','Doc')} P{meta.get('page_label', meta.get('page','?'))}]**: {preview}...\n"
-                    seen_texts.add(preview)
+                for n in retrieved_nodes:
+                    meta = n.get("metadata", {})
+                    content = n.get("text", "")
+                    
+                    # Text Citation
+                    preview = content[:50].replace('\n', ' ')
+                    if preview not in seen_texts:
+                        yield f"> **[{meta.get('file_name','Doc')} P{meta.get('page_label', meta.get('page','?'))}]**: {preview}...\n"
+                        seen_texts.add(preview)
 
-                # Image Citation
-                fname = meta.get("file_name", "")
-                if fname not in ["Web", "Textbook"]:
-                    try:
-                        safe_name = Path(fname).stem.replace(" ", "_")
-                        page_idx = meta.get("page_label", meta.get("page", "?"))
+                    # Image Citation
+                    fname = meta.get("file_name", "")
+                    if fname not in ["Web", "Textbook"]:
+                        try:
+                            safe_name = Path(fname).stem.replace(" ", "_")
+                            page_idx = meta.get("page_label", meta.get("page", "?"))
                         
-                        # Check local storage for images associated with this page
-                        img_dir = DATA_DIR / "parser_cache" / safe_name / "images"
-                        prefix = f"p{page_idx}_"
+                            # Check local storage for images associated with this page
+                            img_dir = DATA_DIR / "parser_cache" / safe_name / "images"
+                            prefix = f"p{page_idx}_"
 
-                        print(f"🔍 [ImgDebug] 寻找图片: {prefix} in {img_dir}")
-                        if img_dir.exists():
-                            for f in os.listdir(img_dir):
-                                if f.startswith(prefix) and f.lower().endswith(('.jpg', '.png', '.jpeg')):
-                                    img_url = f"{API_BASE_URL}/static/parser_cache/{safe_name}/images/{f}"
-                                    if img_url not in seen_images:
-                                        print(f"✅ [ImgDebug] 找到图片: {img_url}")
-                                        yield f"\n![Page {page_idx}]({img_url})\n"
-                                        seen_images.add(img_url)
-                        else:
-                             print(f"❌ [ImgDebug] 目录不存在: {img_dir}")
+                            print(f"🔍 [ImgDebug] 寻找图片: {prefix} in {img_dir}")
+                            if img_dir.exists():
+                                for f in os.listdir(img_dir):
+                                    if f.startswith(prefix) and f.lower().endswith(('.jpg', '.png', '.jpeg')):
+                                        img_url = f"{API_BASE_URL}/static/parser_cache/{safe_name}/images/{f}"
+                                        if img_url not in seen_images:
+                                            print(f"✅ [ImgDebug] 找到图片: {img_url}")
+                                            yield f"\n![Page {page_idx}]({img_url})\n"
+                                            seen_images.add(img_url)
+                            else:
+                                 print(f"❌ [ImgDebug] 目录不存在: {img_dir}")
 
-                    except Exception as e:
-                        print(f"⚠️ Image Error: {e}")
-                        traceback.print_exc()
+                        except Exception as e:
+                            print(f"⚠️ Image Error: {e}")
+                            traceback.print_exc()
+        except Exception as e:
+            yield "\n\n⚠️ 出现错误，请稍后再试"
+            traceback.print_exc()
 
     return StreamingResponse(response_generator(), media_type="text/plain")
 
@@ -176,6 +252,68 @@ async def get_graph(request: ChatRequest):
     if not request.messages: return result_data
     
     query = request.messages[-1]["content"]
+
+    query_hash = hashlib.md5(query.strip().lower().encode("utf-8")).hexdigest()
+    CACHE_VERSION = "v1"
+    cache_key = f"graph:{CACHE_VERSION}:{query_hash}"
+
+    try:
+        query_vec = await get_query_embedding(query)
+
+        if query_vec and len(query_vec) == 1536 and qdrant_client:
+            version_filter = rest.Filter(
+                must=[
+                    rest.FieldCondition(
+                        key="cache_version",
+                        match=rest.MatchValue(value=CACHE_VERSION)
+                    ),
+                    rest.FieldCondition(
+                        key="model",
+                        match=rest.MatchValue(value="dashscope-v2")
+                    )
+                ]
+            )
+
+            search_res = qdrant_client.query_points(
+                collection_name=SEMANTIC_COLLECTION,
+                query=query_vec,
+                limit=1,
+                score_threshold=0.86,
+                query_filter=version_filter,
+            )
+
+            if search_res and hasattr(search_res, "points") and len(search_res.points) > 0:
+                hit = search_res.points[0]
+                payload_data = hit.payload or {}
+                cached_graph = payload_data.get("graph_data")
+                original_q = payload_data.get("query")
+                
+                if cached_graph:
+                    print(f"⚡ [Semantic Hit] '{query}' ≈ '{original_q}' (sim: {hit.score:.4f})")
+                    if redis_client:
+                        query_hash = hashlib.md5(query.strip().lower().encode("utf-8")).hexdigest()
+                        cache_key = f"graph:v1:{query_hash}"
+                        # 压缩并写回 Redis
+                        compressed = gzip.compress(json.dumps(cached_graph).encode("utf-8"))
+                        await redis_client.set(cache_key, compressed, ex=3600)
+                    return cached_graph
+            else:
+                print(f"ℹ️ [Semantic Cache] No similar query found above 0.86 threshold.")
+    except Exception as e:
+        print(f"⚠️ Semantic Cache Check Failed: {e}")
+  
+    if redis_client:
+        cached_data = await redis_client.get(cache_key)
+        if cached_data:
+            try:
+                decompressed = gzip.decompress(cached_data).decode("utf-8")
+                print(f"⚡ [Cache Hit] Graph served from Redis for: {query}")
+                return json.loads(decompressed)
+            except Exception:
+                pass
+        
+    print(f"🐢 [Cache Miss] Generating Graph for: {query}")
+
     try:
         # Use the LLM instance directly from the Pack
         prompt = f"Extract 1-3 technical entities from '{query}', comma separated. No intro/outro."
@@ -206,8 +344,38 @@ async def get_graph(request: ChatRequest):
         
         if neo4j_driver:
             with neo4j_driver.session() as session:
-                res = session.run(cypher, kw=keywords)
-                result_data["links"] = [r.data() for r in res]
+                result_data["links"] = session.execute_read(
+                    lambda tx: [r.data() for r in tx.run(cypher, kw=keywords)]
+                )
+        
+        if result_data["links"]:
+            # 1. 存入 Redis (短期精确缓存)
+            if redis_client:
+                compressed = gzip.compress(json.dumps(result_data).encode("utf-8"))
+                await redis_client.set(cache_key, compressed, ex=3600)
+            
+            semantic_id = hashlib.md5(
+                (query.strip().lower() + "|dashscope-v2" + CACHE_VERSION).encode("utf-8")
+            ).hexdigest()
+
+            # 2. 存入 Qdrant (长期语义缓存)
+            if query_vec and qdrant_client:
+                qdrant_client.upsert(
+                    collection_name=SEMANTIC_COLLECTION,
+                    points=[
+                        rest.PointStruct(
+                            id=semantic_id,
+                            vector=query_vec,
+                            payload={
+                                "query": query,
+                                "graph_data": result_data,
+                                "created_at": time.time(),
+                                "model": "dashscope-v2",
+                                "cache_version": CACHE_VERSION,
+                            }
+                        )
+                    ]
+                )
                 
     except Exception as e:
         print(f"Graph Error: {e}")

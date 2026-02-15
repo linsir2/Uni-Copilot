@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import nest_asyncio
+import asyncio
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from pydantic import PrivateAttr
@@ -274,7 +275,6 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         self.workflow = EduMatrixWorkflow(
             retriever=None,
             llm=self.llm,
-            timeout=120,
             tavily_api_key=tavily_api_key,
         )
 
@@ -384,8 +384,7 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
             "**IMPORTANT**: Detect the dominant language of the provided text and generate the summary **IN THAT SAME LANGUAGE**.\n\n"
             f"--- DOCUMENT CONTENT ---\n{full_text}"
         )
-
-        summary_res = await self.llm.acomplete(summary_prompt)
+        summary_res = await asyncio.wait_for(self.llm.acomplete(summary_prompt), timeout=30)
         global_summary = summary_res.text
 
         summary_node = TextNode(
