@@ -65,40 +65,123 @@ class HybridRetriever(BaseRetriever):
     deduplicates based on content hash, and re-ranks by score.
     """
 
-    def __init__(self, vector_retriever: BaseRetriever, graph_retriever: BaseRetriever):
+    def __init__(self, vector_retriever: BaseRetriever, graph_retriever: BaseRetriever, chunk_store: QdrantVectorStore):
         self.vector = vector_retriever
         self.graph = graph_retriever
+        self.chunk_store = chunk_store
         super().__init__()
 
     def _retrieve(self, query_bundle) -> List[NodeWithScore]:
         # 1. Parallel Retrieval
         vec_nodes = self.vector.retrieve(query_bundle)
         graph_nodes = self.graph.retrieve(query_bundle)
+        
+        # RRF Algorithm
+        rrf_k = 60
+        merged_scores = {}
+        node_map = {}
 
-        combined = []
-        seen_hashes = set()
+        def process_nodes(nodes):
+            for rank, n in enumerate(nodes):
+                if n.node.metadata.get("is_global_summary") == "true":
+                    continue
 
-        # 2. Merge Strategy: Prioritize Vector results
-        all_nodes = vec_nodes + graph_nodes
+                node_type = type(n.node).__name__
+                node_key = f"{node_type}:{n.node.node_id}"
+                if node_key not in node_map:
+                    node_map[node_key] = n.node
+                
+                current_score = merged_scores.get(node_key, 0.0)
+                merged_scores[node_key] = current_score + 1 / (rrf_k + rank + 1)
+        
+        process_nodes(vec_nodes)
+        process_nodes(graph_nodes)
 
-        for n in all_nodes:
-            content = n.node.get_content()
+        sorted_candidates = sorted(
+            merged_scores.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        final_nodes: List[NodeWithScore] = []
+        seen_hashes: set[str] = set()
+
+        for node_id, score in sorted_candidates:
+            node = node_map[node_id]
+            content = node.get_content()
+
             if not content:
                 continue
 
-            # Deduplicate based on content fingerprint
-            norm_text = content[:200].strip().lower()
-            h = hashlib.md5(norm_text.encode("utf-8")).hexdigest()
+            norm_text = (content[:200] + content[-200:]).strip().lower()
+            content_hash = hashlib.md5(norm_text.encode("utf-8")).hexdigest()
 
-            if h not in seen_hashes:
-                combined.append(n)
-                seen_hashes.add(h)
+            if content_hash in seen_hashes:
+                continue
 
-        # 3. Unified Sorting: Descending by score
-        combined.sort(key=lambda x: x.score or 0.0, reverse=True)
-        return combined
+            final_nodes.append(
+                NodeWithScore(node=node, score=score)
+            )
+            seen_hashes.add(content_hash)
 
+        return final_nodes
 
+    async def fetch_global_summary(self) -> List[NodeWithScore]:
+        """
+        🛑 Fallback Method:
+        Directly fetch the global summary node from Qdrant using metadata filter.
+        Bypasses vector similarity search entirely.
+        """
+        try:
+            client = self.chunk_store.client
+
+            scroll_filter = rest.Filter(
+                must=[
+                    rest.FieldCondition(
+                        key="is_global_summary",
+                        match=rest.MatchValue(value="true")
+                    )
+                ]
+            )
+
+            if asyncio.iscoroutinefunction(client.scroll):
+                points, _ = await client.scroll(
+                    collection_name=self.chunk_store.collection_name,
+                    scroll_filter=scroll_filter,
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            else:
+                points, _ = client.scroll(
+                    collection_name=self.chunk_store.collection_name,
+                    scroll_filter=scroll_filter,
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False
+                )
+
+            if not points:
+                print("⚠️ No Global Summary found in DB.")
+                return []
+            
+            payload = points[0].payload
+            text = payload.get("text", "") or payload.get("_node_content", "{}")
+
+            if isinstance(text, str) and text.startswith("{"):
+                try:
+                    content_dict = json.loads(text)
+                    text = content_dict.get("text", "")
+                except:
+                    pass
+            
+            node = TextNode(text=text, metadata=payload)
+            return [NodeWithScore(node=node, score=0.01)]
+        
+        except Exception as e:
+            print(f"❌ Failed to fetch global summary: {e}")
+            return []
+            
 # --- Helper: Sidecar Extractor ---
 class MetadataGraphExtractor(TransformComponent):
     """
@@ -237,7 +320,7 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
             self.llm = llm
         elif dashscope_api_key:
             self.llm = DashScope(
-                model_name="qwen-plus-latest", api_key=dashscope_api_key, temperature=0.1
+                model_name="qwen-flash-2025-07-28", api_key=dashscope_api_key, temperature=0.1
             )
         else:
             raise ValueError(
@@ -393,6 +476,7 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
                 "file_name": safe_name,
                 "is_global_summary": "true",
                 "page": "all",
+                "section_title": "summary",
             },
         )
 
@@ -404,29 +488,58 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
 
         self.vector_store_chunks.add([summary_node])
         print(f"✅ Global Summary stored: {global_summary[:50]}...")
-
-        # 2. Batch Upsert Entities
-        print("🔄 Upserting Entities from Sidecar...")
+        
+        print(f"🔄 准备从 Sidecar 加载实体: {sidecar_file}")
         all_entities = []
+        
         if sidecar_file.exists():
-            try:
-                with open(sidecar_file, "r", encoding="utf-8") as f:
+            # 1. 直接读取，不再静默失败
+            with open(sidecar_file, "r", encoding="utf-8") as f:
+                try:
                     data = json.load(f)
-                    for p in data.values():
-                        all_entities.extend(p.get("graph_data", {}).get("entities", []))
-            except Exception:
-                pass
+                    print(f"📄 Sidecar JSON 读取成功，共包含 {len(data)} 页")
+                except json.JSONDecodeError as e:
+                    print(f"❌ Sidecar JSON 格式错误: {e}")
+                    data = {}
+
+            # 2. 遍历提取，打印每页的实体数量
+            for page_key, page_val in data.items():
+                # 兼容可能的结构差异
+                graph_data = page_val.get("graph_data")
+                if not graph_data:
+                    print(f"⚠️  Page {page_key}: 缺少 'graph_data' 字段，跳过")
+                    continue
+                
+                ents = graph_data.get("entities", [])
+                if ents:
+                    print(f"   - Page {page_key}: 提取到 {len(ents)} 个实体")
+                    all_entities.extend(ents)
+                else:
+                    print(f"   - Page {page_key}: 'entities' 列表为空")
+        else:
+            print(f"❌ 严重错误: Sidecar 文件未找到! 路径: {sidecar_file}")
+
+        print(f"📊 实体汇总: 总计 {len(all_entities)} 个实体准备入库")
 
         if all_entities:
-            upsert_entities(
-                self.qdrant_client,
-                self.collections["entities"],
-                self.neo4j_creds["url"],
-                self.neo4j_creds["user"],
-                self.neo4j_creds["password"],
-                all_entities,
-                embed_text_wrapper,
-            )
+            try:
+                print("🚀 开始执行 upsert_entities...")
+                upsert_stats = upsert_entities(
+                    self.qdrant_client,
+                    self.collections["entities"],
+                    self.neo4j_creds["url"],
+                    self.neo4j_creds["user"],
+                    self.neo4j_creds["password"],
+                    all_entities,
+                    embed_text_wrapper,
+                )
+                print(f"✅ 实体入库成功! 统计: {upsert_stats}")
+            except Exception as e:
+                print(f"❌ 入库过程发生异常: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("⚠️ 警告: 实体列表为空，跳过数据库写入步骤。")
 
         # 3. Chunking & Vector Indexing
         print("💾 Indexing Chunks...")
@@ -524,7 +637,9 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         graph_retriever = graph_index.as_retriever(sub_retrievers=[sub_retriever])
 
         self.workflow.retriever = HybridRetriever(
-            vector_retriever=vector_retriever, graph_retriever=graph_retriever
+            vector_retriever=vector_retriever, 
+            graph_retriever=graph_retriever,
+            chunk_store=self.vector_store_chunks,
         )
         print("✅ Hybrid Retriever (Vector + Graph) is active!")
 

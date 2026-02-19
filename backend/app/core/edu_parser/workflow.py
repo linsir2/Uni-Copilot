@@ -265,8 +265,6 @@ class EduMatrixWorkflow(Workflow):
         async with self._llm_semaphore:
             for attempt in range(retries + 1):
                 try:
-                    # 修复: Base.py 报错的原因是这里传了 timeout，确保 LlamaIndex 版本兼容
-                    # 如果 LlamaIndex 底层不支持 timeout，外层 asyncio.wait_for 是唯一解
                     res = await asyncio.wait_for(self.llm.acomplete(prompt), timeout=self.config.timeout_llm)
                     data = extract_json_from_text(res.text)
                     if data: return data
@@ -382,6 +380,14 @@ class EduMatrixWorkflow(Workflow):
         try:
             nodes = await asyncio.wait_for(self.retriever.aretrieve(search_query), timeout=self.config.timeout_search)
             
+            if not nodes:
+                print("⚠️ Standard retrieval empty, triggering Fallback Summary...")
+                if hasattr(self.retriever, "fetch_global_summary"):
+                    fallback_nodes = await self.retriever.fetch_global_summary()
+                    if fallback_nodes:
+                        nodes = fallback_nodes
+                        print("✅ Fallback Summary loaded.")
+
             if len(nodes) > 3:
                 reranked = await self._rerank_nodes(search_query, nodes, self.config.rerank_top_n)
                 self._add_trace_local(trace_id, "Rerank", "SUCCESS", {"original": len(nodes), "kept": len(reranked), "method": "Local" if self._reranker else "LLM"})
@@ -503,7 +509,7 @@ class EduMatrixWorkflow(Workflow):
         sys_hint, rec = "", ""
         if ev.best_node_idx == -1: rec = "broaden"; sys_hint = "No nodes. Try 'broaden'."
         elif ev.score == 1: rec = "narrow"; sys_hint = "Weak. Try 'narrow'."
-        
+    
         if rec and rec in curr_banned: rec = ""; sys_hint = "Try new approach."
         if advice["recommend"]: sys_hint += f"\n(Winners: {', '.join(advice['recommend'])})"
 
@@ -561,7 +567,17 @@ class EduMatrixWorkflow(Workflow):
         if not serialized_nodes and ev.source != "fallback":
             return StopEvent(result={"final_response": "No relevant info found.", "retrieved_nodes": [], "debug_timeline": timeline})
 
-        sys_msg = ChatMessage(role="system", content="Answer based on context. Cite sources. Focus on [⭐ BEST MATCH].")
+        sys_msg = ChatMessage(
+            role="system",
+            content=(
+                "You are a meticulous technical assistant who answers strictly based on the provided context.\n"
+                "Do not use any external knowledge to explain terms, concepts, or acronyms not defined in the document (e.g., LoRA, Transformer).\n"
+                "If the document only lists parameter configurations without definitions, provide the configuration details as-is; do not add explanations.\n"
+                "If the context is insufficient to answer a question, respond clearly with: 'According to the current document, this cannot be answered.'\n"
+                "Always cite sources inline and give priority to [⭐ BEST MATCH]."
+            )
+        )
+
         user_msg = ChatMessage(role="user", content=f"Context:\n{''.join(context_lines)}\n\nQuestion: {original_q}")
 
         try:

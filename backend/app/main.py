@@ -3,17 +3,17 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import time
 import traceback
-import shutil
 import hashlib
 import json
 import gzip
 import dashscope
+import asyncio
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -22,7 +22,7 @@ from redis import asyncio as aioredis
 from redis.asyncio import Redis
 
 from core.edu_parser.base import MultimodalAgenticRAGPack
-from worker import parse_pdf
+from worker import celery_app
 
 load_dotenv()
 
@@ -40,7 +40,7 @@ NEO4J_URL = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-rag_pack: MultimodalAgenticRAGPack
+rag_pack: MultimodalAgenticRAGPack | None = None
 redis_client: Redis | None = None
 neo4j_driver = None  # Kept separate for the raw graph visualization endpoint
 qdrant_client = None
@@ -63,6 +63,15 @@ async def get_query_embedding(text: str):
     except Exception as e:
         print(f"⚠️ Embedding Error: {e}")
     return []
+
+async def send_celery_task(file_path):
+    loop = asyncio.get_running_loop()
+    # 把同步 send_task 调用放到线程池，不阻塞 event loop
+    task = await loop.run_in_executor(
+        None,
+        lambda: celery_app.send_task("parse_pdf_task", args=[str(file_path)])
+    )
+    return task
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,35 +137,46 @@ async def upload_pdf(file: UploadFile = File(...)):
     """
     上传 PDF -> Celery Ingestion
     """
+    print("ROUTE HIT", flush=True)
+
     # 1. 确保数据目录存在
     upload_dir = DATA_DIR / "uploads"
     if not upload_dir.exists():
         upload_dir.mkdir(parents=True, exist_ok=True)
 
-    file_content = await file.read()
-    file_hash = hashlib.md5(file_content).hexdigest()
-    await file.seek(0)
-
-    cache_key = f"pdf:task:{file_hash}"
-    if redis_client:
-        existing_task_id = await redis_client.get(cache_key)
-        if existing_task_id:
-            return {
-                "status": "cached",
-                "task_id": existing_task_id,
-                "message": f"⚡ 秒传成功！{file.filename} 之前已上传过。",
-            }
-        
-    # 2. 保存文件到本地
     file_path = upload_dir / (file.filename or "")
+
+    hasher = hashlib.md5()
+
     try:
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                buffer.write(chunk)
+        print("保存成功")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File save failed: {e}")
+    
+    file_hash = hasher.hexdigest()
+    cache_key = f"pdf:task:{file_hash}"
+
+    # if redis_client:
+    #     existing_task_id = await redis_client.get(cache_key)
+    #     if existing_task_id:
+    #         return {
+    #             "status": "cached",
+    #             "task_id": existing_task_id,
+    #             "message": f"⚡ 秒传成功！{file.filename} 之前已上传过。",
+    #         }
 
     # 3. 发送给Celery
-    task = parse_pdf.delay(str(file_path))
+    try:
+        task = await send_celery_task(file_path)
+    except Exception as e:
+        print("❌ send_task failed:", e)
 
     if redis_client:
         await redis_client.set(

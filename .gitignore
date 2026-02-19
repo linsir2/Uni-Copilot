@@ -45,7 +45,12 @@ examples/data/
 examples/data_test/
 dbs/
 
+test/my_golden_dataset.csv
+test/final_eval_report.csv
+
 backend/app/local_cache/
+backend/app/local_cache/.locks/
+backend/app/evolution_logs.jsonl
 
 parsed_images/
 examples/parsed_images/

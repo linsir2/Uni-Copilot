@@ -1,10 +1,12 @@
+import os
+os.environ["HF_ENDPOINT"]="https://hf-mirror.com"
 from celery import Celery
 from celery.signals import worker_process_init
 from core.edu_parser.base import MultimodalAgenticRAGPack
 from dotenv import load_dotenv
 from pathlib import Path
 import asyncio
-import os
+
 
 load_dotenv()
 
@@ -27,27 +29,39 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
-rag_pack: MultimodalAgenticRAGPack
+rag_pack: MultimodalAgenticRAGPack | None = None
+
+def get_rag_pack():
+    global rag_pack
+    if rag_pack is None:
+        print("🧠 Initializing RAG-PACK inside task...")
+        rag_pack = MultimodalAgenticRAGPack(
+            qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            neo4j_password=os.getenv("NEO4J_PASSWORD", "password"),
+            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
+            tavily_api_key=os.getenv("TAVILY_API_KEY"),
+            data_dir=str(DATA_DIR),
+            force_recreate=True,
+        )
+        print("✅ RAG-PACK ready")
+    return rag_pack
 
 @worker_process_init.connect
-def init_rag_pack(**kwargs):
+def init_worker(**kwargs):
     global rag_pack
+    rag_pack = get_rag_pack() 
 
-    rag_pack = MultimodalAgenticRAGPack(
-        qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
-        neo4j_password=os.getenv("NEO4J_PASSWORD", "password"),
-        dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
-        tavily_api_key=os.getenv("TAVILY_API_KEY"),
-        data_dir=str(DATA_DIR),
-        force_recreate=True,
-    )
-
-    print("Worker 进程初始化成功，RAG-PACK 已就绪")
 
 @celery_app.task(bind=True, name="parse_pdf_task")
 def parse_pdf(self, pdf_path):
     try:
+        print("🔥 INGEST TASK STARTED:", pdf_path)
+
         asyncio.run(rag_pack.run_ingestion(pdf_path))
+
+        print("✅ INGEST TASK FINISHED:", pdf_path)
         return {"status": "ok", "pdf_path": pdf_path}
+
     except Exception as e:
+        print("❌ INGEST FAILED:", e)
         raise self.retry(exc=e, countdown=5)

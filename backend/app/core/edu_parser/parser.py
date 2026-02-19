@@ -51,7 +51,7 @@ DEFAULT_VLM_PROMPT = (
     "You are an expert Teaching Assistant. Analyze this image for **Knowledge Graph Construction** and **Exam Review**.\n"
     "Your tasks: 1. Filter Noise 2. Extract Structured Knowledge.\n\n"
     "**Step 1: Classification**\n"
-    "- 'NOISE': Logos, page numbers, decorative headers/footers, blurry icons, pure background, watermarks, generic clip art, silhouettes, stock photos with no educational value.\n"
+    "- 'NOISE': Logos, page numbers, decorative headers/footers, blurry icons, pure background, watermarks, generic clip art, silhouettes, stock photos with no educational value. DO NOT classify architecture diagrams or flowcharts as NOISE, even if they contain simple icons or are low resolution.\n"
     "- 'ARCH': System architecture, block diagrams.\n"
     "- 'FLOW': Algorithms, flowcharts, sequence diagrams.\n"
     "- 'CODE': Code snippets, terminal outputs.\n"
@@ -541,32 +541,32 @@ class EduMatrixPDFReader:
                             json_data = self._extract_json(text)
                             result_type = json_data.get("type", "UNKNOWN")
 
-                            ban_words = {
-                                "silhouette",
-                                "logo",
-                                "icon",
-                                "watermark",
-                                "copyright",
-                                "advertisement",
-                                "stock photo",
-                                "decorative",
-                            }
-                            caption_lower = json_data.get("dense_caption", "").lower()
-                            keywords_lower = {
-                                k.lower() for k in json_data.get("keywords", [])
-                            }
+                            # ban_words = {
+                            #     "silhouette",
+                            #     "logo",
+                            #     "icon",
+                            #     "watermark",
+                            #     "copyright",
+                            #     "advertisement",
+                            #     "stock photo",
+                            #     "decorative",
+                            # }
+                            # caption_lower = json_data.get("dense_caption", "").lower()
+                            # keywords_lower = {
+                            #     k.lower() for k in json_data.get("keywords", [])
+                            # }
 
-                            # Heuristic Filter
-                            if any(w in caption_lower for w in ban_words) or any(
-                                w in keywords_lower for w in ban_words
-                            ):
-                                logger.info(
-                                    f"🗑️ Heuristic Filter: Forced NOISE for img={img_hash[:8]}"
-                                )
-                                result_type = "NOISE"
-                                json_data["type"] = "NOISE"
-                                json_data["entities"] = []
-                                json_data["relations"] = []
+                            # # Heuristic Filter
+                            # if any(w in caption_lower for w in ban_words) or any(
+                            #     w in keywords_lower for w in ban_words
+                            # ):
+                            #     logger.info(
+                            #         f"🗑️ Heuristic Filter: Forced NOISE for img={img_hash[:8]}"
+                            #     )
+                            #     result_type = "NOISE"
+                            #     json_data["type"] = "NOISE"
+                            #     json_data["entities"] = []
+                            #     json_data["relations"] = []
 
                             if (
                                 result_type in self.VALID_TYPES
@@ -629,6 +629,8 @@ class EduMatrixPDFReader:
                             break
                         text = page.extract_text()
                         if text:
+                            text = re.sub(r"\n\s*[\*\•\-\>]\s*\n", "\n", text)
+
                             pages_content[i]["raw_text"] = text
                             pages_content[i]["text_parts"].append(text)
 

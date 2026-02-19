@@ -47,7 +47,8 @@ def upload_file(files):
                 res_json = response.json()
                 results.append(
                     f"✅ {os.path.basename(file_obj.name)} 上传成功\n"
-                    f"   ↳ task_id: {res_json.get('task_id', 'N/A')}"
+                    f"   ↳ task_id: {res_json.get('task_id', 'N/A')}\n"
+                    f"   ↳ 状态：后台处理中"
                 )
             else:
                 results.append(
