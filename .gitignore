@@ -44,6 +44,7 @@ data_test/
 examples/data/
 examples/data_test/
 dbs/
+local_cache/
 
 test/my_golden_dataset.csv
 test/final_eval_report.csv
