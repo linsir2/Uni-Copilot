@@ -1,5 +1,4 @@
 import os
-os.environ["HF_ENDPOINT"]="https://hf-mirror.com"
 from celery import Celery
 from celery.signals import worker_process_init
 from core.edu_parser.base import MultimodalAgenticRAGPack
@@ -38,7 +37,6 @@ def get_rag_pack():
         rag_pack = MultimodalAgenticRAGPack(
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             neo4j_password=os.getenv("NEO4J_PASSWORD", "password"),
-            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
             tavily_api_key=os.getenv("TAVILY_API_KEY"),
             data_dir=str(DATA_DIR),
             force_recreate=True,

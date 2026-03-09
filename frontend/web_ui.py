@@ -212,7 +212,7 @@ with gr.Blocks(title="EduMatrix Pro", css=custom_css) as demo:
             )
             upload_btn = gr.Button("🚀 开始上传与摄取", variant="primary")
             upload_status = gr.Textbox(label="系统状态", interactive=False, lines=4)
-            gr.Chatbot()
+
             gr.Markdown("---")
             gr.Markdown("### ℹ️ 使用说明")
             gr.Markdown(
@@ -263,34 +263,36 @@ with gr.Blocks(title="EduMatrix Pro", css=custom_css) as demo:
     )
 
     # 2. 聊天 (提交 -> 聊天流 + 图谱生成 并行)
-    # 使用 .then 串联或并联事件
-    # 注意：为了让用户体验更好，图谱和聊天应该同时开始
+    def clear_textbox():
+        return ""
     
     # 回车提交
     txt_input.submit(
         chat_stream, 
         inputs=[txt_input, chatbot], 
         outputs=[chatbot]
+    ).then(
+        clear_textbox, None, txt_input
     )
     txt_input.submit(
         generate_graph_html,
         inputs=[txt_input],
         outputs=[graph_output]
     )
-    txt_input.submit(lambda: "", None, txt_input) # 清空输入框
 
     # 按钮提交
     submit_btn.click(
         chat_stream, 
         inputs=[txt_input, chatbot], 
         outputs=[chatbot]
+    ).then(
+        clear_textbox, None, txt_input
     )
     submit_btn.click(
         generate_graph_html,
         inputs=[txt_input],
         outputs=[graph_output]
     )
-    submit_btn.click(lambda: "", None, txt_input)
 
     # 清空
     clear_btn.click(lambda: [], None, chatbot)

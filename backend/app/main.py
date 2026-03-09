@@ -1,12 +1,9 @@
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
 import time
 import traceback
 import hashlib
 import json
 import gzip
-import dashscope
 import asyncio
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
@@ -20,7 +17,8 @@ from pydantic import BaseModel
 from neo4j import GraphDatabase
 from redis import asyncio as aioredis
 from redis.asyncio import Redis
-
+from litellm import aembedding
+from langfuse import observe, get_client
 from core.edu_parser.base import MultimodalAgenticRAGPack
 from worker import celery_app
 
@@ -47,19 +45,22 @@ qdrant_client = None
 
 SEMANTIC_COLLECTION = "graph_query_cache"
 
-async def get_query_embedding(text: str):
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        return None
-    
+@observe(name="Semantic_Cache_Embedding", as_type="span")
+async def get_query_embedding(text: str, trace_id: str):
     try:
-        resp = dashscope.TextEmbedding.call(
-            model=dashscope.TextEmbedding.Models.text_embedding_v2,
-            input=text,
-            api_key=api_key,
+        resp = await aembedding(
+            model="text-embedding-3-large", # 确保与 config.yaml 对应
+            api_base="http://localhost:4000",
+            api_key="sk-anything",
+            input=[text],
+            encoding_format="float",
+            # 🔥 注入 Langfuse 追踪
+            metadata={
+                "trace_id": trace_id,
+                "generation_name": "LiteLLM_Cache_Embedding"
+            }
         )
-        if resp.status_code == 200:
-            return resp.output["embeddings"][0]["embedding"]
+        return resp.data[0]["embedding"]
     except Exception as e:
         print(f"⚠️ Embedding Error: {e}")
     return []
@@ -85,7 +86,6 @@ async def lifespan(app: FastAPI):
             neo4j_url=NEO4J_URL,
             neo4j_username=NEO4J_USER,
             neo4j_password=NEO4J_PASSWORD,
-            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
             tavily_api_key=os.getenv("TAVILY_API_KEY"),
             data_dir=str(DATA_DIR),
         )
@@ -101,10 +101,14 @@ async def lifespan(app: FastAPI):
 
         if not qdrant_client.collection_exists(SEMANTIC_COLLECTION):
             print(f"📦 Creating Semantic Cache Collection: {SEMANTIC_COLLECTION}")
+            test_vec = await get_query_embedding("test", trace_id="startup_test")
+            cache_dim = len(test_vec) if test_vec else 1024
+            print(f"📏 Initializing Semantic Cache with Dimension: {cache_dim}")
+
             qdrant_client.create_collection(
                 collection_name=SEMANTIC_COLLECTION,
                 vectors_config=rest.VectorParams(
-                    size=1536, # 🔥 注意：DashScope text-embedding-v2 是 1536 维
+                    size=cache_dim, 
                     distance=rest.Distance.COSINE
                 )
             )
@@ -264,6 +268,7 @@ async def chat_endpoint(request: ChatRequest):
     return StreamingResponse(response_generator(), media_type="text/plain")
 
 @app.post("/api/graph")
+@observe(name="Graph_Visualization_Endpoint")
 async def get_graph(request: ChatRequest):
     """
     Extracts keywords using the Pack's LLM and queries Neo4j for visualization.
@@ -273,14 +278,18 @@ async def get_graph(request: ChatRequest):
     
     query = request.messages[-1]["content"]
 
+    client = get_client()
+    trace_id = client.get_current_trace_id()
+    client.update_current_trace(session_id="web_ui")
+
     query_hash = hashlib.md5(query.strip().lower().encode("utf-8")).hexdigest()
     CACHE_VERSION = "v1"
     cache_key = f"graph:{CACHE_VERSION}:{query_hash}"
 
     try:
-        query_vec = await get_query_embedding(query)
+        query_vec = await get_query_embedding(query, trace_id=trace_id)
 
-        if query_vec and len(query_vec) == 1536 and qdrant_client:
+        if query_vec and qdrant_client:
             version_filter = rest.Filter(
                 must=[
                     rest.FieldCondition(
@@ -337,7 +346,9 @@ async def get_graph(request: ChatRequest):
     try:
         # Use the LLM instance directly from the Pack
         prompt = f"Extract 1-3 technical entities from '{query}', comma separated. No intro/outro."
-        res = await rag_pack.llm.acomplete(prompt)
+        res = await rag_pack.llm.acomplete(
+            prompt,
+        )
         keywords = [k.strip() for k in res.text.split(',') if k.strip()] or [query]
 
         cypher = """

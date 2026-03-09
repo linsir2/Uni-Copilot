@@ -49,8 +49,11 @@ local_cache/
 test/my_golden_dataset.csv
 test/final_eval_report.csv
 
+test.py
+
 backend/app/local_cache/
 backend/app/local_cache/.locks/
+backend/app/evolution_logs.jsonl.2026-*
 backend/app/evolution_logs.jsonl
 
 parsed_images/

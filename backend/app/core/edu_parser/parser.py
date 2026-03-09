@@ -2,9 +2,7 @@ import os
 import re
 import fitz  # PyMuPDF
 import pdfplumber
-import dashscope
 from pathlib import Path
-from http import HTTPStatus
 from llama_index.core import Document
 import asyncio
 from typing import List, Dict, Any, Optional, Tuple
@@ -17,6 +15,11 @@ from PIL import Image
 from collections import Counter
 import logging
 import numpy as np
+from langfuse import observe, get_client
+from litellm import aembedding, acompletion
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configure Logging
 logging.basicConfig(
@@ -91,7 +94,6 @@ class EduMatrixPDFReader:
         embedding_cache_file: str = "../data/embedding_cache.json",
         alias_map_file: str = "../data/global_alias_map.json",
         use_vlm: bool = True,
-        vlm_model_name: str = "qwen-vl-max",
         vlm_system_prompt: str = DEFAULT_VLM_PROMPT,
         max_concurrency: int = 5,
         min_image_bytes: int = 3072,
@@ -112,21 +114,12 @@ class EduMatrixPDFReader:
 
         # Configuration
         self.use_vlm = use_vlm
-        self.model_name = vlm_model_name
         self.system_prompt = vlm_system_prompt
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.min_image_bytes = min_image_bytes
         self.max_edge_size = max_edge_size
         self.min_edge_size = min_edge_size
         self.jpeg_quality = jpeg_quality
-
-        # [Check] Validate API Key immediately. Degrade gracefully if missing.
-        self.api_key = os.getenv("DASHSCOPE_API_KEY")
-        if (self.use_vlm) and not self.api_key:
-            logger.warning(
-                "⚠️ DASHSCOPE_API_KEY not found. VLM and Embeddings will be DISABLED."
-            )
-            self.use_vlm = False
 
         # Load Persistent State
         self.cache_data = self._load_json(self.cache_file)
@@ -337,31 +330,37 @@ class EduMatrixPDFReader:
         return None
 
     # --- Embedding & Vector Logic ---
-    async def _get_embedding(self, text: str) -> List[float]:
-        if not self.api_key:
-            return []
+    @observe(name="Get_Embedding", as_type="span")
+    async def _get_embedding_batch(self, texts: List[str]) -> None:
+        client = get_client()
+        trace_id = client.get_current_trace_id()
 
-        if text in self.embedding_map:
-            return self.embedding_map[text]
+        unique_texts = list(set(texts))
+        texts_to_fetch = [t for t in unique_texts if t not in self.embedding_map]
+
+        if not texts_to_fetch:
+            return
 
         try:
-            resp = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: dashscope.TextEmbedding.call(
-                    model=dashscope.TextEmbedding.Models.text_embedding_v2,
-                    input=text,
-                    api_key=self.api_key or "",
-                ),
+            resp = await aembedding(
+                model="text-embedding-3-large",
+                api_base="http://localhost:4000",
+                api_key="sk-anything",
+                input=texts,
+                encoding_format="float",
+                metadata={
+                    "trace_id": trace_id,
+                    "generation_name": "LiteLLM_Embedding",
+                }
             )
-            if resp.status_code == HTTPStatus.OK:
-                emb = resp.output["embeddings"][0]["embedding"]
-                self.embedding_map[text] = emb
-                return emb
-            else:
-                logger.warning(f"Embedding API failed for '{text}': {resp.message}")
+            
+            for i, text in enumerate(texts_to_fetch):
+                self.embedding_map[text] = resp.data[i]["embedding"]
+            client.update_current_span(output=f"Successfully batch embedded {len(texts_to_fetch)} items")
+
         except Exception as e:
-            logger.error(f"Embedding exception for '{text}': {e}")
-        return []
+            logger.error(f"Embedding exception: {e}")
+            client.update_current_span(level="ERROR", status_message=str(e))
 
     def _cosine_similarity(self, vec1, vec2):
         if not vec1 or not vec2:
@@ -379,6 +378,7 @@ class EduMatrixPDFReader:
             return 0.0
         return np.dot(v1, v2) / norm_product
 
+    @observe(as_type="span", name="Graph_Dedup", capture_output=False)
     async def _dedup_graph_data(
         self, entities: List[Dict], relations: List[Dict]
     ) -> Tuple[List[Dict], List[Dict]]:
@@ -388,6 +388,26 @@ class EduMatrixPDFReader:
         """
         unique_entities = []
         seen_entities = set()
+        client = get_client()
+
+        names_to_fetch = []
+        for e in entities:
+            name = e.get("name", "").strip()
+            raw_canonical = e.get("canonical_name", "").strip()
+            if not name or len(name) < 2:
+                continue
+
+            current_name = self._sanitize_canonical_name(name, raw_canonical)
+            name_key = current_name.upper()
+
+            if name_key not in self.global_alias_map:
+                names_to_fetch.append(current_name)
+        
+        if (
+            names_to_fetch
+            and len(self.global_alias_map) < 8000
+        ):
+            await self._get_embedding_batch(names_to_fetch)
 
         # --- 1. Entity Alignment ---
         for e in entities:
@@ -409,11 +429,10 @@ class EduMatrixPDFReader:
                 final_name = current_name
 
                 if (
-                    self.api_key
-                    and len(self.embedding_map) > 0
+                    len(self.embedding_map) > 0
                     and len(self.global_alias_map) < 8000
                 ):
-                    current_vec = await self._get_embedding(current_name)
+                    current_vec = self.embedding_map.get(current_name)
 
                     if current_vec:
                         best_match: str = ""
@@ -481,11 +500,27 @@ class EduMatrixPDFReader:
             if key not in seen_relations:
                 seen_relations.add(key)
                 unique_relations.append(r)
+        
+        input_entity_count = len(entities)
+        output_entity_count = len(unique_entities)
+        merged_count = input_entity_count - output_entity_count
+
+        client.update_current_span(
+            metadata={
+                "input_entities": input_entity_count,
+                "output_entities": output_entity_count,
+                "merged_entities": merged_count,
+                "compressed_rate": f"{merged_count / input_entity_count * 100 if input_entity_count else 0:.1f}%",
+            }
+        )
 
         return unique_entities, unique_relations
 
     # --- VLM Interaction ---
+    @observe(as_type="span", name="VLM_Image_Analysis", capture_input=False)
     async def _describe_image_with_retry(self, img_bytes: bytes, img_hash: str):
+        client = get_client()
+
         if img_hash in self.cache_data:
             cached = self.cache_data[img_hash]
             if cached.get("type") in ["FAILED", "NOISE"]:
@@ -506,106 +541,71 @@ class EduMatrixPDFReader:
         messages = [
             {
                 "role": "user",
-                "content": [{"image": img_data_uri}, {"text": self.system_prompt}],
+                "content": [
+                    {"type": "text", "text": self.system_prompt},
+                    {"type": "image_url", "image_url": {"url": img_data_uri}}
+                ],
             }
         ]
-
+        
+        client.update_current_span(input=messages)
+        trace_id = client.get_current_trace_id()
         async with self.semaphore:
-            for attempt in range(3):
-                try:
-                    response = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: dashscope.MultiModalConversation.call(
-                            model=self.model_name,
-                            messages=messages,
-                            api_key=self.api_key or "",
-                        ),
-                    )
+            try:
+                response = await acompletion(
+                    model="openai/qwen-vlm",
+                    api_base="http://localhost:4000",
+                    api_key="sk-anything",
+                    messages=messages,
+                    metadata={
+                        "trace_id": trace_id,
+                        "generation_name": "Litellm_Vision_Call",
+                    }
+                )
+                text = response.choices[0].message.content   
+                
+                if text:
+                    json_data = self._extract_json(text)
+                    result_type = json_data.get("type", "UNKNOWN")
 
-                    from typing import Any, cast
-
-                    valid_resp = cast(Any, response)
-
-                    if valid_resp.status_code == HTTPStatus.OK:
-                        content = valid_resp.output.choices[0].message.content
-                        if isinstance(content, list):
-                            text = "\n".join(
-                                c.get("text", "")
-                                for c in content
-                                if isinstance(c, dict)
-                            )
-                        else:
-                            text = str(content)
-
-                        if text:
-                            json_data = self._extract_json(text)
-                            result_type = json_data.get("type", "UNKNOWN")
-
-                            # ban_words = {
-                            #     "silhouette",
-                            #     "logo",
-                            #     "icon",
-                            #     "watermark",
-                            #     "copyright",
-                            #     "advertisement",
-                            #     "stock photo",
-                            #     "decorative",
-                            # }
-                            # caption_lower = json_data.get("dense_caption", "").lower()
-                            # keywords_lower = {
-                            #     k.lower() for k in json_data.get("keywords", [])
-                            # }
-
-                            # # Heuristic Filter
-                            # if any(w in caption_lower for w in ban_words) or any(
-                            #     w in keywords_lower for w in ban_words
-                            # ):
-                            #     logger.info(
-                            #         f"🗑️ Heuristic Filter: Forced NOISE for img={img_hash[:8]}"
-                            #     )
-                            #     result_type = "NOISE"
-                            #     json_data["type"] = "NOISE"
-                            #     json_data["entities"] = []
-                            #     json_data["relations"] = []
-
-                            if (
-                                result_type in self.VALID_TYPES
-                                or result_type == "UNKNOWN"
-                            ):
-                                self.cache_data[img_hash] = json_data
-                                return json_data
-                            elif result_type == "NOISE":
-                                self.cache_data[img_hash] = json_data
-                                return None
-                    else:
-                        logger.warning(
-                            f"API Error: {valid_resp.code} - {valid_resp.message}"
-                        )
-
-                except Exception as e:
-                    logger.warning(
-                        f"[VLM ERROR] img={img_hash[:8]} attempt={attempt + 1} err={e}"
-                    )
-                    if attempt < 2:
-                        await asyncio.sleep(2**attempt)
+                    if result_type in self.VALID_TYPES or result_type == "UNKNOWN":
+                        self.cache_data[img_hash] = json_data
+                        return json_data
+                    elif result_type == "NOISE":
+                        self.cache_data[img_hash] = json_data
+                        return None
+                    
+            except Exception as e:
+                logger.warning(f"[VLM ERROR] img={img_hash[:8]} err={e}")
+                client.update_current_span(level="ERROR", status_message=str(e))
 
             self.cache_data[img_hash] = {"type": "FAILED"}
             return None
 
     # --- Main Pipeline ---
+    @observe(name="Parser")
     async def parse(self) -> List[Document]:
         """
         Main parsing pipeline: PDF -> Text/Tables/Images -> Sidecar Data -> LlamaIndex Docs.
         """
         logger.info(f"🐢 [EduMatrix Parser] Starting: {self.pdf_path.name}")
+        client = get_client()
+        client.update_current_trace(
+            session_id=self.pdf_path.name,
+            metadata={"file_path": str(self.pdf_path)}
+        )
+
         pages_content: Dict[int, Dict[str, Any]] = {}
         all_image_tasks = []
 
         try:
             doc_fitz = fitz.open(self.pdf_path)
             total_pages = len(doc_fitz)
+            client.update_current_trace(metadata={"total_pages": total_pages})
         except Exception as e:
             logger.error(f"Failed to open PDF {self.pdf_path}: {e}")
+            client.update_current_span(level="ERROR", status_message=f"Failed to open PDF {self.pdf_path}: {e}")
+            client.flush()
             return []
 
         for i in range(total_pages):
@@ -644,182 +644,199 @@ class EduMatrixPDFReader:
             except Exception as e:
                 logger.error(f"PDFPlumber error: {e}")
 
-        await asyncio.get_event_loop().run_in_executor(None, extract_text)
+        with client.start_as_current_observation(name="Extract_Text", as_type="span"):
+            await asyncio.get_event_loop().run_in_executor(None, extract_text)
 
-        logger.info("    🖼️ Extracting images...")
-        for i in range(total_pages):
-            page_fitz = doc_fitz[i]
-            image_list = page_fitz.get_images(full=True)
+        def prepare_images():
+            logger.info("    🖼️ Extracting images...")
+            for i in range(total_pages):
+                page_fitz = doc_fitz[i]
+                image_list = page_fitz.get_images(full=True)
 
-            for img_idx, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    rects = page_fitz.get_image_rects(xref)
-                    bbox = [float(x) for x in rects[0]] if rects else []
-                    base_image = doc_fitz.extract_image(xref)
-                    img_bytes = base_image["image"]
-
-                    w, h = base_image.get("width", 0), base_image.get("height", 0)
-                    if (
-                        len(img_bytes) < self.min_image_bytes
-                        or w < self.min_edge_size
-                        or h < self.min_edge_size
-                    ):
-                        continue
-
-                    aspect_ratio = w / h
-                    if aspect_ratio > 10 or aspect_ratio < 0.1:
-                        continue
-
+                for img_idx, img in enumerate(image_list):
                     try:
-                        with Image.open(io.BytesIO(img_bytes)) as pil_img:
-                            gray_img = pil_img.convert("L")
-                            extrema = gray_img.getextrema()
+                        xref = img[0]
+                        rects = page_fitz.get_image_rects(xref)
+                        bbox = [float(x) for x in rects[0]] if rects else []
+                        base_image = doc_fitz.extract_image(xref)
+                        img_bytes = base_image["image"]
 
-                            # [Fix] Explicit type check for tuple
-                            if isinstance(extrema, tuple) and len(extrema) == 2:
-                                mn, mx = extrema
-                                # Double check numbers to avoid Pylance issues
-                                if isinstance(mn, (int, float)) and isinstance(
-                                    mx, (int, float)
-                                ):
-                                    if mx - mn < 10:
-                                        continue
-                    except Exception:
-                        pass
+                        w, h = base_image.get("width", 0), base_image.get("height", 0)
+                        if (
+                            len(img_bytes) < self.min_image_bytes
+                            or w < self.min_edge_size
+                            or h < self.min_edge_size
+                        ):
+                            continue
 
-                    img_hash = self._compute_semantic_hash(img_bytes)
-                    img_ext = base_image["ext"]
-                    img_path = (
-                        self.image_output_dir
-                        / f"p{i + 1}_{img_idx}_{img_hash[:8]}.{img_ext}"
+                        aspect_ratio = w / h
+                        if aspect_ratio > 10 or aspect_ratio < 0.1:
+                            continue
+
+                        try:
+                            with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                                gray_img = pil_img.convert("L")
+                                extrema = gray_img.getextrema()
+
+                                # [Fix] Explicit type check for tuple
+                                if isinstance(extrema, tuple) and len(extrema) == 2:
+                                    mn, mx = extrema
+                                    # Double check numbers to avoid Pylance issues
+                                    if isinstance(mn, (int, float)) and isinstance(
+                                        mx, (int, float)
+                                    ):
+                                        if mx - mn < 10:
+                                            continue
+                        except Exception:
+                            pass
+
+                        img_hash = self._compute_semantic_hash(img_bytes)
+                        img_ext = base_image["ext"]
+                        img_path = (
+                            self.image_output_dir
+                            / f"p{i + 1}_{img_idx}_{img_hash[:8]}.{img_ext}"
+                        )
+
+                        if not img_path.exists():
+                            with open(img_path, "wb") as f:
+                                f.write(img_bytes)
+
+                        task = self._describe_image_with_retry(img_bytes, img_hash)
+                        all_image_tasks.append(task)
+
+                        pages_content[i]["image_meta"].append(
+                            {
+                                "task_idx": len(all_image_tasks) - 1,
+                                "path": str(img_path),
+                                "bbox": bbox,
+                                "hash": img_hash,
+                                "local_idx": img_idx,
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Image extract error p{i}: {e}")
+        with client.start_as_current_observation(name="Prepare_Images", as_type="span"):
+            await asyncio.get_event_loop().run_in_executor(None, prepare_images)
+            
+        doc_fitz.close()
+        client.update_current_trace(metadata={"total_images": len(all_image_tasks)})
+        
+        @observe(name="VLM_Process")
+        async def execute_vlm():
+            image_results: List[Any] = [None] * len(all_image_tasks)
+            if all_image_tasks:
+                logger.info(f"    🚀 Processing {len(all_image_tasks)} images...")
+                results = await asyncio.gather(*all_image_tasks, return_exceptions=True)
+
+                for j, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        logger.error(f"Task failed: {res}")
+                        image_results[j] = None
+                    else:
+                        image_results[j] = res
+            return image_results
+
+        image_results = await execute_vlm()
+
+        @observe(name="Assemble_Document")
+        async def assemble_docs():
+            final_documents = []
+            current_section_title = "General"
+
+            for i in range(total_pages):
+                page_data = pages_content[i]
+                title = self._extract_section_title(page_data["raw_text"])
+                if title:
+                    current_section_title = title
+
+                text_kws = self._extract_text_keywords(page_data["raw_text"])
+                page_data["page_keywords"].extend(text_kws)
+
+                for meta in page_data["image_meta"]:
+                    res = image_results[meta["task_idx"]]
+                    if isinstance(res, Exception) or not res:
+                        continue
+
+                    if res.get("type") in ["NOISE", "NONE", "UNKNOWN", "FAILED"]:
+                        continue
+
+                    caption_block = (
+                        f"\n>>> [IMAGE: {res.get('type')}]\n"
+                        f"Caption: {res.get('dense_caption')}\n"
+                        f"OCR: {res.get('ocr_text')}\n"
+                        f"<<<\n"
                     )
+                    page_data["text_parts"].append(caption_block)
 
-                    if not img_path.exists():
-                        with open(img_path, "wb") as f:
-                            f.write(img_bytes)
+                    # Limit image keywords
+                    if res.get("keywords"):
+                        page_data["page_keywords"].extend(res.get("keywords")[:3])
 
-                    task = self._describe_image_with_retry(img_bytes, img_hash)
-                    all_image_tasks.append(task)
+                    if meta["hash"] not in self.global_processed_imgs:
+                        self.global_processed_imgs.add(meta["hash"])
 
-                    pages_content[i]["image_meta"].append(
+                        if res.get("entities"):
+                            for e in res.get("entities"):
+                                e.update({"source": "image", "page": i + 1})
+                            page_data["graph_entities"].extend(res.get("entities"))
+
+                        if res.get("relations"):
+                            for r in res.get("relations"):
+                                r.update({"provenance": "image", "page": i + 1})
+                            page_data["graph_relations"].extend(res.get("relations"))
+
+                    page_data["evidence_images"].append(
                         {
-                            "task_idx": len(all_image_tasks) - 1,
-                            "path": str(img_path),
-                            "bbox": bbox,
-                            "hash": img_hash,
-                            "local_idx": img_idx,
+                            "path": meta["path"],
+                            "bbox": meta["bbox"],
+                            "type": res.get("type"),
+                            "caption": res.get("dense_caption"),
                         }
                     )
-                except Exception as e:
-                    logger.warning(f"Image extract error p{i}: {e}")
-        doc_fitz.close()
 
-        image_results: List[Any] = [None] * len(all_image_tasks)
-        if all_image_tasks:
-            logger.info(f"    🚀 Processing {len(all_image_tasks)} images...")
-            results = await asyncio.gather(*all_image_tasks, return_exceptions=True)
+                kw_counter = Counter(page_data["page_keywords"])
+                top_kws = [k for k, v in kw_counter.most_common(15)]
+                keywords_str = ", ".join(top_kws)
 
-            for j, res in enumerate(results):
-                if isinstance(res, Exception):
-                    logger.error(f"Task failed: {res}")
-                    image_results[j] = None
-                else:
-                    image_results[j] = res
-
-        final_documents = []
-        current_section_title = "General"
-
-        for i in range(total_pages):
-            page_data = pages_content[i]
-            title = self._extract_section_title(page_data["raw_text"])
-            if title:
-                current_section_title = title
-
-            text_kws = self._extract_text_keywords(page_data["raw_text"])
-            page_data["page_keywords"].extend(text_kws)
-
-            for meta in page_data["image_meta"]:
-                res = image_results[meta["task_idx"]]
-                if isinstance(res, Exception) or not res:
-                    continue
-
-                if res.get("type") in ["NOISE", "NONE", "UNKNOWN", "FAILED"]:
-                    continue
-
-                caption_block = (
-                    f"\n>>> [IMAGE: {res.get('type')}]\n"
-                    f"Caption: {res.get('dense_caption')}\n"
-                    f"OCR: {res.get('ocr_text')}\n"
-                    f"<<<\n"
-                )
-                page_data["text_parts"].append(caption_block)
-
-                # Limit image keywords
-                if res.get("keywords"):
-                    page_data["page_keywords"].extend(res.get("keywords")[:3])
-
-                if meta["hash"] not in self.global_processed_imgs:
-                    self.global_processed_imgs.add(meta["hash"])
-
-                    if res.get("entities"):
-                        for e in res.get("entities"):
-                            e.update({"source": "image", "page": i + 1})
-                        page_data["graph_entities"].extend(res.get("entities"))
-
-                    if res.get("relations"):
-                        for r in res.get("relations"):
-                            r.update({"provenance": "image", "page": i + 1})
-                        page_data["graph_relations"].extend(res.get("relations"))
-
-                page_data["evidence_images"].append(
-                    {
-                        "path": meta["path"],
-                        "bbox": meta["bbox"],
-                        "type": res.get("type"),
-                        "caption": res.get("dense_caption"),
-                    }
+                full_text = (
+                    f"[SECTION] {current_section_title}\n"
+                    f"[KEYWORDS] {keywords_str}\n"
+                    f"=== Page {i + 1} ===\n" + "\n".join(page_data["text_parts"])
                 )
 
-            kw_counter = Counter(page_data["page_keywords"])
-            top_kws = [k for k, v in kw_counter.most_common(15)]
-            keywords_str = ", ".join(top_kws)
-
-            full_text = (
-                f"[SECTION] {current_section_title}\n"
-                f"[KEYWORDS] {keywords_str}\n"
-                f"=== Page {i + 1} ===\n" + "\n".join(page_data["text_parts"])
-            )
-
-            # Async Deduplication
-            u_ents, u_rels = await self._dedup_graph_data(
-                page_data["graph_entities"], page_data["graph_relations"]
-            )
-
-            page_id = f"{self.pdf_path.name}_p{i + 1}"
-
-            self.page_heavy_data[page_id] = {
-                "graph_data": {"entities": u_ents, "relations": u_rels},
-                "evidence_images": page_data["evidence_images"],
-                "raw_text_len": len(page_data["raw_text"]),
-            }
-
-            final_documents.append(
-                Document(
-                    text=full_text,
-                    metadata={
-                        "file_name": self.pdf_path.name,
-                        "page_label": str(i + 1),
-                        "section_title": current_section_title,
-                        "content_type": "page_compound",
-                        "page_id_key": page_id,
-                        "has_images": len(page_data["evidence_images"]) > 0,
-                    },
+                # Async Deduplication
+                u_ents, u_rels = await self._dedup_graph_data(
+                    page_data["graph_entities"], page_data["graph_relations"]
                 )
-            )
+
+                page_id = f"{self.pdf_path.name}_p{i + 1}"
+
+                self.page_heavy_data[page_id] = {
+                    "graph_data": {"entities": u_ents, "relations": u_rels},
+                    "evidence_images": page_data["evidence_images"],
+                    "raw_text_len": len(page_data["raw_text"]),
+                }
+
+                final_documents.append(
+                    Document(
+                        text=full_text,
+                        metadata={
+                            "file_name": self.pdf_path.name,
+                            "page_label": str(i + 1),
+                            "section_title": current_section_title,
+                            "content_type": "page_compound",
+                            "page_id_key": page_id,
+                            "has_images": len(page_data["evidence_images"]) > 0,
+                        },
+                    )
+                )
+            return final_documents
+        
+        final_documents = await assemble_docs()
 
         self._save_data()
         logger.info(
             f"✅ Parsing complete! Generated {len(final_documents)} slim document chunks."
         )
+        # client.flush()
         return final_documents

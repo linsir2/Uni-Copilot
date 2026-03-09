@@ -3,7 +3,6 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import pandas as pd
 from backend.app.core.edu_parser.base import MultimodalAgenticRAGPack
-from llama_index.llms.dashscope import DashScope
 from datasets import Dataset
 from ragas import evaluate
 from ragas.metrics import (
@@ -22,7 +21,6 @@ df = pd.read_csv(test_csv)
 rag_pack = MultimodalAgenticRAGPack(
     qdrant_url=os.getenv("QDRANT_URL") or "",
     neo4j_password="password123",
-    dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
     tavily_api_key=os.getenv("TAVILY_API_KEY"),
 )
 async def main():

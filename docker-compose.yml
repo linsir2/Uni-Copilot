@@ -29,9 +29,26 @@ services:
       - "6379:6379" # 终端输入：docker exec -it edu_redis redis-cli ping 
       - "8001:8001" 
   
-  # web:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: edu_litellm
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    command: [ "--config", "/app/config.yaml", "--port", "4000" ]
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/1
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+
+  # client:
   #   build:  .
-  #   command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+  #   command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
   #   ports:
   #     - "8000:8000"
   #   volumes:

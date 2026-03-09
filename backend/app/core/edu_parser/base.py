@@ -1,7 +1,5 @@
-import os
 import json
 import hashlib
-import nest_asyncio
 import asyncio
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -37,12 +35,15 @@ from llama_index.core.llms import LLM
 # LlamaIndex Integrations
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-from llama_index.llms.dashscope import DashScope
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from llama_index.llms.openai_like import OpenAILike
+from llama_index.embeddings.openai import OpenAIEmbedding
 # Qdrant & Neo4j Drivers
 import qdrant_client
 from qdrant_client.http import models as rest
 from neo4j import GraphDatabase
+
+# Langfuse
+from langfuse import observe, get_client
 
 # Local Imports
 from .parser import EduMatrixPDFReader
@@ -50,8 +51,15 @@ from .workflow import EduMatrixWorkflow
 from .entity_upsert import upsert_entities
 
 # Apply nest_asyncio
-nest_asyncio.apply()
+# 遇到 uvloop 时静默跳过，不再强行打补丁
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ValueError as e:
+    print(f"ℹ️ Skipping nest_asyncio: {e}")
 
+import litellm
+litellm._turn_on_debug()
 
 def embed_text_wrapper(text: str) -> List[float]:
     """Wraps the global embedding model for the upsert utility."""
@@ -294,7 +302,6 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         neo4j_url: str = "bolt://localhost:7687",
         neo4j_username: str = "neo4j",
         neo4j_password: str = "password",
-        dashscope_api_key: Optional[str] = None,
         llm: Optional[LLM] = None,
         embed_model: Optional[BaseEmbedding] = None,
         qdrant_api_key: Optional[str] = None,
@@ -304,7 +311,6 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         data_dir: str = "./data_sidecar",
         force_recreate: bool = False,
     ) -> None:
-        self.dashscope_api_key = dashscope_api_key
         self.neo4j_creds = {
             "url": neo4j_url,
             "user": neo4j_username,
@@ -318,23 +324,26 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         # 1. Setup Models
         if llm is not None:
             self.llm = llm
-        elif dashscope_api_key:
-            self.llm = DashScope(
-                model_name="qwen-flash-2025-07-28", api_key=dashscope_api_key, temperature=0.1
-            )
         else:
-            raise ValueError(
-                "❌ Init Error: Please provide either an 'llm' object or a 'dashscope_api_key'."
+            import os
+            os.environ["OPENAI_API_KEY"] = "sk-anything"
+            self.llm = OpenAILike(
+                model="qwen-reasoning",
+                api_key="sk-anything", 
+                api_base="http://localhost:4000",
+                is_chat_model=True,
+                default_headers={"encoding_format": "float"},
             )
 
         if embed_model is not None:
             self.embed_model = embed_model
         else:
             print("ℹ️ No embed_model provided, falling back to default embed_model")
-            self.embed_model = FastEmbedEmbedding(
-                model_name="BAAI/bge-small-zh-v1.5",
-                threads=None,
-                cache_dir="./local_cache",
+            self.embed_model = OpenAIEmbedding(
+                model_name="text-embedding-3-large",
+                api_base="http://localhost:4000",
+                api_key="sk-anything",
+                default_headers={"encoding_format": "float"},
             )
 
         Settings.llm = self.llm
@@ -393,7 +402,7 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
             )
             if is_entity:
                 self.qdrant_client.create_payload_index(
-                    name, "name", rest.PayloadSchemaType.KEYWORD
+                    name, "normalized_name", rest.PayloadSchemaType.KEYWORD
                 )
 
     def _clear_neo4j(self):
@@ -419,12 +428,18 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         except Exception:
             pass
 
+    @observe(name="EduMatrix_Ingestion_Pipeline")
     async def run_ingestion(self, pdf_path: str):
-        if not self.dashscope_api_key:
-            raise ValueError(
-                "❌ Ingestion Error: 'dashscope_api_key' is required for PDF parsing (VLM), "
-                "even if you use a different LLM for retrieval."
-            )
+        client = get_client()
+        trace_id = client.get_current_trace_id()
+
+        injection_payload = {
+            "metadata": {
+                "trace_id": trace_id,
+                "generation_name": "LlamaIndex_Auto_Batch",
+            }
+        }
+        self.llm.additional_kwargs = injection_payload
 
         print(f"🚀 Starting ingestion for {pdf_path}...")
 
@@ -443,7 +458,6 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         self._clear_neo4j()
 
         # 1. Parse PDF
-        os.environ["DASHSCOPE_API_KEY"] = self.dashscope_api_key
         reader = EduMatrixPDFReader(
             pdf_path=pdf_path,
             image_output_dir=str(cache_dir / "images"),
@@ -455,7 +469,7 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         )
         documents = await reader.parse()
 
-        print("📝 Generating Global Summary...")
+        print("📝 Generating Global Summary...", flush=True)
 
         # Limit context to avoid token overflow (30k chars is approx 8k-10k tokens)
         full_text = "\n".join([d.text for d in documents])[:30000]
@@ -467,8 +481,31 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
             "**IMPORTANT**: Detect the dominant language of the provided text and generate the summary **IN THAT SAME LANGUAGE**.\n\n"
             f"--- DOCUMENT CONTENT ---\n{full_text}"
         )
-        summary_res = await asyncio.wait_for(self.llm.acomplete(summary_prompt), timeout=30)
-        global_summary = summary_res.text
+        from openai import AsyncOpenAI
+        
+        openai_client = AsyncOpenAI(
+            api_key="sk-anything",
+            base_url="http://localhost:4000",
+            timeout=60,
+            max_retries=1,
+        )
+        summary_res = await openai_client.chat.completions.create(
+            model="qwen-reasoning",
+            messages=[{"role": "user", "content": summary_prompt}],
+            temperature=0.1,
+        )
+        global_summary = summary_res.choices[0].message.content
+        # summary_res = await asyncio.wait_for(
+        #     self.llm.acomplete(
+        #         summary_prompt,
+        #         metadata={
+        #             "trace_id": trace_id,
+        #             "generation_name": "Global_Summary_LLM"
+        #         }
+        #     ), 
+        #     timeout=300
+        # )
+        # global_summary = summary_res.text
 
         summary_node = TextNode(
             text=f"【Global Document Summary / 全文摘要】\n{global_summary}",
@@ -643,7 +680,11 @@ class MultimodalAgenticRAGPack(BaseLlamaPack):
         )
         print("✅ Hybrid Retriever (Vector + Graph) is active!")
 
+    @observe(name="Query_Pipeline")
     async def run(self, query: str, **kwargs: Any) -> Any:
+        client = get_client()
+        trace_id = client.get_current_trace_id()
+        
         if not self.workflow.retriever:
             self._refresh_retriever()
-        return await self.workflow.run(question=query, **kwargs)
+        return await self.workflow.run(question=query, trace_id=trace_id, **kwargs)

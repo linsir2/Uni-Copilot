@@ -1,0 +1,73 @@
+model_list:
+  - model_name: qwen-reasoning
+    litellm_params:
+      model: openai/qwen-flash
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+
+  - model_name: qwen-plus
+    litellm_params:
+      model: openai/qwen-plus-2025-09-11
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+  
+  # 轻量任务模型处理
+  - model_name: qwen-turbo
+    litellm_params:
+      model: openai/qwen-turbo-latest
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+  
+  # 向量化模型
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-v4                  
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+
+  - model_name: text-embedding-3-large
+    litellm_params:
+      model: openai/text-embedding-v4                  
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+  
+  # 视觉理解
+  - model_name: qwen-vlm
+    litellm_params:
+      model: openai/qwen3-vl-flash-2026-01-22
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+  
+  - model_name: qwen-vlm
+    litellm_params:
+      model: openai/qwen3-vl-flash
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+  
+  # 重排
+  - model_name: qwen-rerank
+    litellm_params:
+      model: openai/qwen3-rerank
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      encoding_format: "float"
+
+router_settings:
+  fallbacks: [{"qwen-reasoning": ["qwen-plus"]}]
+  routing_strategy: "latency-based-routing"
+
+litellm_settings:
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  num_retries: 2
+  set_verbose: true
+  request_timeout: 300
+  allowed_fails: 3
+  cooldown_time: 60

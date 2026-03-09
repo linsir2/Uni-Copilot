@@ -28,13 +28,6 @@ from llama_index.core.llms import ChatMessage
 
 from langfuse import get_client
 
-# Try importing local reranker
-try:
-    from sentence_transformers import CrossEncoder
-    HAS_LOCAL_RERANKER = True
-except ImportError:
-    HAS_LOCAL_RERANKER = False
-
 logger = logging.getLogger("EduMatrixWorkflow")
 
 # ================= Configuration =================
@@ -222,14 +215,6 @@ class EduMatrixWorkflow(Workflow):
         self._trace_buffers: Dict[str, List[dict]] = defaultdict(list)
         self._llm_semaphore = asyncio.Semaphore(self.config.max_concurrent_llm_calls)
         self.lf = get_client()
-        
-        self._reranker = None
-        if HAS_LOCAL_RERANKER:
-            try:
-                self._reranker = CrossEncoder(self.config.local_rerank_model, max_length=512)
-                logger.info(f"✅ Local Reranker Loaded: {self.config.local_rerank_model}")
-            except Exception as e:
-                logger.warning(f"❌ Local Reranker Load Failed: {e}")
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is not None and not self._http_client.is_closed: return self._http_client
@@ -269,38 +254,36 @@ class EduMatrixWorkflow(Workflow):
             return content
         except Exception: return "[Error]"
 
-    async def _llm_call(self, prompt: str, trace_id: str, step_name: str, fallback: Optional[Dict[Any, Any]] = None, retries: int = 2) -> dict:
-        model_name = getattr(self.llm, "model_name", "unknown_llm")
+    async def _llm_call(self, prompt: str, trace_id: str, step_name: str, fallback: Optional[Dict[Any, Any]] = None) -> dict:
         with self.lf.start_as_current_observation(
-            as_type="generation",
+            as_type="span",
             name=f"{step_name}_LLM_Call",
             trace_context={"trace_id": trace_id},
-            model=model_name,
-            input=prompt
-        ) as generation:
+            input=prompt,
+        ) as span:
             async with self._llm_semaphore:
-                for attempt in range(retries + 1):
-                    try:
-                        res = await asyncio.wait_for(self.llm.acomplete(prompt), timeout=self.config.timeout_llm)
+                try:
+                    res = await asyncio.wait_for(
+                        self.llm.acomplete(
+                            prompt,    
+                        ), 
+                        timeout=self.config.timeout_llm 
+                    )
 
-                        generation.update(
-                            output=res.text,
-                            # 注意，langfuse运行成功之后，记得这里需要再添加上token消耗啥的，就是usage_details，统一用litellm来写
-                        )
+                    span.update(output=res.text)
 
-                        data = extract_json_from_text(res.text)
-                        if data: return data
-                    except asyncio.TimeoutError:
-                        if attempt == retries: 
-                            logger.warning("LLM Timeout")
-                            generation.update(level="ERROR", status_message="Timeout")
-                    except Exception as e:
-                        logger.warning(f"LLM fail: {e}")
-                        generation.update(level="ERROR", status_message=str(e))
+                    data = extract_json_from_text(res.text)
+                    if data: 
+                        return data
+                    
+                except asyncio.TimeoutError:
+                    logger.warning("LLM Timeout")
+                    span.update(level="ERROR", status_message="Timeout")
+                except Exception as e:
+                    logger.warning(f"LLM fail: {e}")
+                    span.update(level="ERROR", status_message=str(e))
 
-                    if attempt < retries: await asyncio.sleep(0.5 * (attempt + 1))
-                
-                generation.update(level="WARNING", status_message="All retries failed, using fallback.", output=str(fallback))
+                span.update(level="WARNING", status_message="All retries failed, using fallback.", output=str(fallback))
                 return fallback or {}
 
     async def _rerank_nodes(self, query: str, nodes: List[NodeWithScore], top_n: int, trace_id: str) -> List[NodeWithScore]:
@@ -312,28 +295,47 @@ class EduMatrixWorkflow(Workflow):
             trace_context={"trace_id": trace_id},
             input={"query": query, "nodes_count": len(nodes)},
         ) as span:
-            # 1. Try Local Cross-Encoder
-            if self._reranker:
-                try:
-                    pairs = [(query, self._safe_get_content(n)) for n in nodes]
-                    scores = await asyncio.get_event_loop().run_in_executor(None, self._reranker.predict, pairs)
+            try:
+                documents = [self._safe_get_content(n) for n in nodes]
+                client = await self._get_client()
                 
-                    for n, s in zip(nodes, scores):
-                        n.score = float(s)
+                resp = await client.post(
+                    "http://localhost:4000/v1/rerank",
+                    json={
+                        "model": "qwen-rerank",
+                        "query": query,
+                        "documents": documents,
+                        "top_n": top_n
+                    },
+                    headers={"trace_id": trace_id, "Authorization": "Bearer sk-anything"}
+                )
+                resp.raise_for_status()
+                rerank_data = resp.json()
                 
-                    # 修复: sorted 遇到 None score 会报错，加 default
-                    reranked = sorted(nodes, key=lambda x: x.score or 0.0, reverse=True)
-                    span.update(output={"method": "Local_CrossEncoder"})
-                    return reranked[:top_n]
-                except Exception as e:
-                    logger.error(f"Local Rerank Failed: {e}, fallback to LLM")
-                    span.update(level="ERROR", status_message=str(e))
+                # 解析返回结果，格式通常为: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
+                results = rerank_data.get("results", [])
+                
+                # 按返回的索引重新组装 nodes
+                reranked = []
+                for res in results:
+                    idx = res.get("index")
+                    score = res.get("relevance_score")
+                    if idx is not None and 0 <= idx < len(nodes):
+                        nodes[idx].score = float(score)
+                        reranked.append(nodes[idx])
+                
+                span.update(output={"method": "Cloud_LiteLLM_Reranker"})
+                return reranked
+
+            except Exception as e:
+                logger.error(f"Cloud Rerank Failed: {e}, fallback to LLM")
+                span.update(level="ERROR", status_message=f"Cloud Rerank Failed: {str(e)}")
 
             # 2. Fallback to LLM
             candidates = []
             for i, n in enumerate(nodes):
                 text = self._safe_get_content(n)[:150].replace("\n", " ")
-            candidates.append(f"ID {i}: {text}")
+                candidates.append(f"ID {i}: {text}")
         
             prompt = (
                 f"Query: {query}\nCandidates:\n{chr(10).join(candidates)}\n\n"
@@ -406,11 +408,11 @@ class EduMatrixWorkflow(Workflow):
     # --- Step 1: Retrieve ---
     @step
     async def retrieve(self, ctx: Context, ev: Union[StartEvent, RewriteEvent]) -> GradeEvent:
-        trace_id = await ctx.store.get("trace_id", default=uuid4().hex)
-
         if isinstance(ev, StartEvent):
             question = ev.get("question", "")
             if not question: return GradeEvent()
+
+            trace_id = ev.get("trace_id") or uuid4().hex
             
             await ctx.store.set("trace_id", trace_id)
             await ctx.store.set("original_question", question)
@@ -425,6 +427,7 @@ class EduMatrixWorkflow(Workflow):
             self._add_trace_local(trace_id, "Retrieve", "START", {"query": question})
             is_retry, strategy = False, None
         else:
+            trace_id = await ctx.store.get("trace_id")
             search_query = ev.original_query
             self._add_trace_local(trace_id, "Retrieve", "RETRY", {"new_query": search_query, "strategy": ev.strategy})
             is_retry, strategy = True, ev.strategy
@@ -450,7 +453,7 @@ class EduMatrixWorkflow(Workflow):
 
                 if len(nodes) > 3:
                     reranked = await self._rerank_nodes(search_query, nodes, self.config.rerank_top_n, trace_id)
-                    self._add_trace_local(trace_id, "Rerank", "SUCCESS", {"original": len(nodes), "kept": len(reranked), "method": "Local" if self._reranker else "LLM"})
+                    self._add_trace_local(trace_id, "Rerank", "SUCCESS", {"original": len(nodes), "kept": len(reranked)})
                     nodes = reranked
 
                 self._add_trace_local(trace_id, "Retrieve", "SUCCESS", {"count": len(nodes)})
@@ -679,22 +682,15 @@ class EduMatrixWorkflow(Workflow):
 
             user_msg = ChatMessage(role="user", content=f"Context:\n{''.join(context_lines)}\n\nQuestion: {original_q}")
 
-            with self.lf.start_as_current_observation(
-                trace_context={"trace_id": trace_id},
-                name="Streaming_Response",
-                as_type="generation",
-                model=getattr(self.llm, "model_name", "unknown-llm"),
-                input={"user_message": user_msg.content}
-            ) as generation:
-                try:
-                    stream = await self.llm.astream_chat([sys_msg, user_msg])
-                    generation.update(output="[Streaming Response Started...]")
-                    span.update(output="Streaming successfully initiated")
-                except Exception as e:
-                    generation.update(level="ERROR", status_message=str(e))
-                    span.update(level="ERROR", status_message=str(e))
-                    logger.exception("Generate Failed")
-                    return StopEvent(result={"final_response": f"Generation Error: {str(e)}", "retrieved_nodes": serialized_nodes, "debug_timeline": timeline})
+            try:
+                stream = await self.llm.astream_chat(
+                    [sys_msg, user_msg],
+                )
+                span.update(output="Streaming successfully initiated")
+            except Exception as e:
+                span.update(level="ERROR", status_message=str(e))
+                logger.exception("Generate Failed")
+                return StopEvent(result={"final_response": f"Generation Error: {str(e)}", "retrieved_nodes": serialized_nodes, "debug_timeline": timeline})
 
             self._trace_buffers.pop(trace_id, None)
             return StopEvent(result={"final_response": stream, "retrieved_nodes": serialized_nodes, "debug_timeline": timeline})
